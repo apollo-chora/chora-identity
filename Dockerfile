@@ -24,6 +24,7 @@ ARG BUILD_TIME=unknown
 # Stage 1 — build
 ############################
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+ARG TARGETARCH
 
 ARG SERVICE_NAME
 ARG GIT_SHA
@@ -39,7 +40,7 @@ RUN go mod download
 
 ENV CGO_ENABLED=0 \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${TARGETARCH}
 RUN go build -trimpath -ldflags "-s -w" -o /out/service ./cmd/server
 
 # The seed job ships alongside the server so the same image can provision a
