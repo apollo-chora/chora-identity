@@ -1,0 +1,3 @@
+tenant_slug;tenant_name;email;roles
+beta-inst;Beta Institute;Dora@Beta.example;"learner;author"
+beta-inst;Beta Institute;evan@beta.example;admin

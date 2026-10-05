@@ -1,0 +1,12 @@
+tenant_slug,tenant_name,email,ROLES,email,bogus_col,send_invite
+Acme-Corp ,Acme Corp,dupe@acme.example,learner,ignored@acme.example,junk,maybe
+acme corp,Acme Corp,gina@acme.example,learner,,,true
+acme-corp,Acme Corp,not-an-email,learner,,,
+acme-corp,Acme Corp,hank@acme.example,owner|learner,,,
+acme-corp,Acme Corp,iris@acme.example,wizard,,,
+acme-corp,Acme Corp,,learner,,,
+acme-corp,Acme Corp,jane@acme.example,learner,,,,extra
+acme-corp,Acme Corp,kim@acme.example,platform_operator,,,
+acme-corp,Acme Corp,liam@acme.example,learner,,,
+,,,,,,
+

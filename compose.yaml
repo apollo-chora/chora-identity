@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.15.0-alpine
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Idempotently provisions the JetStream streams the event bus expects:
+  # CHORA_EVENTS (chora.>) and CHORA_DLQ (_dlq.>).
+  nats-init:
+    image: natsio/nats-cli:0.1.5
+    restart: "no"
+    depends_on:
+      nats:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        nats stream add CHORA_EVENTS --subjects='chora.>' --storage=file --replicas=1 --retention=limits --discard=old --max-age=720h --duplicate-window=24h --server=nats://nats:4222 || true
+        nats stream add CHORA_DLQ --subjects='_dlq.>' --storage=file --replicas=1 --retention=limits --discard=old --max-age=2160h --server=nats://nats:4222 || true
+
+  identity:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    ports:
+      - "${PORT:-8080}:8080"
+      - "${CHORA_GRPC_PORT:-9090}:9090"
+
+volumes:
+  postgres-data:
+  nats-data:

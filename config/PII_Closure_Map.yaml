@@ -1,0 +1,92 @@
+# PII_Closure_Map for chora-identity domain.
+#
+# Source-of-truth: .claude/skills/account-closure-saga/SKILL.md
+#                  .claude/rules/ddd-enforcement.md "Account Closure"
+#
+# Owning team: Team 3 (Platform). Owning DB: chora_identity.
+#
+# Identity is the saga's HOME database — most PII tokenisation lands here.
+# WebAuthn credentials are dropped (cannot be re-issued); GCID itself is
+# preserved (tombstone display) so FK integrity across all domains is intact.
+
+domain: chora_identity
+version: "1.0"
+
+fields_to_tokenize:
+  - table: users
+    columns:
+      - column: email
+        strategy: tombstone_email
+        value: "user-{hash}@redacted.invalid"
+      - column: display_name
+        strategy: tombstone_string
+        value: "Former member"
+      - column: phone_number
+        strategy: drop
+        value: ""
+      - column: avatar_url
+        strategy: drop
+        value: ""
+      - column: locale
+        strategy: preserve
+        value: ""
+      - column: timezone
+        strategy: preserve
+        value: ""
+
+  - table: passkey_credentials
+    columns:
+      - column: credential_id
+        strategy: drop
+        value: ""
+      - column: public_key
+        strategy: drop
+        value: ""
+      - column: aaguid
+        strategy: drop
+        value: ""
+
+  - table: kyc_verifications
+    columns:
+      # Per Path A (2026-05-10) the Singpass scope is minimised to one
+      # persisted attribute. NRIC, FIN, raw or hashed, are not stored.
+      # The Singpass-issued legal name is requested only because the
+      # developer portal Step 3 form requires at least one MyInfo data
+      # scope; the value is discarded on receipt and never reaches this
+      # table. Verification metadata (status, method, verified_at) is
+      # preserved at the row level until the retention window expires.
+      - column: singpass_sub
+        strategy: drop
+        value: ""
+
+  - table: oidc_subject_mappings
+    columns:
+      - column: subject
+        strategy: drop
+        value: ""
+      - column: issuer
+        strategy: preserve
+        value: ""
+
+  - table: course_role_assignments
+    columns:
+      # GCID + course_id are FK-bearing; do NOT drop. Tombstone the
+      # display name only.
+      - column: assigned_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+retention_days_by_jurisdiction:
+  EU: 2557      # GDPR — 7 years
+  SG: 2557      # PDPA — 7 years
+  US: 1826      # CCPA — 5 years
+  ZA: 1826      # POPIA — 5 years
+  BR: 1826      # LGPD — 5 years
+  default: 2557
+
+on_creator_closure:
+  # Identity isn't a creator-of-content domain; this entry is mainly for
+  # role assignments where an admin (now closed) previously granted a role.
+  # Strategy: keep the assignment, tokenise the granter's display.
+  strategy: tokenise_authorship_keep_atom
+  show_authorship_as: "Former member"

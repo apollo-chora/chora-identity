@@ -1,0 +1,28 @@
+-- =============================================================================
+-- chora-identity : 0013z_drop_stray_role_catalog.up.sql
+--
+-- Domain        : Identity (supporting/platform)
+-- Database      : chora_identity
+-- Architecture  : docs/architecture/adrs/adr-165 (role catalogue) +
+--                 1c platform-debt pass item 3 (2026-06-11)
+--
+-- Purpose:
+--   Reconcile the HAND-MADE `role_catalog` table (created out-of-band
+--   2026-05-26 during the A5/H+ wave with columns role_code/description)
+--   so that 0014_platform_operator_role.up.sql — whose canonical shape
+--   (canonical_label/seeded_in/notes) never applied anywhere — can apply
+--   cleanly. The stray shape made 0014's seed INSERT fail with
+--   `column "canonical_label" does not exist`, which FATAL'd every
+--   umbrella migrations-apply run since (the 0014 wall).
+--
+--   The stray table holds only static seed rows (9 roles) that 0014
+--   re-seeds with richer metadata; repo-wide grep confirms NO code reads
+--   role_catalog (comment references only). Dropping it is loss-free.
+--
+--   Filename `0013z` sorts after 0013_* and before 0014_* so the runner
+--   sequences DROP → canonical CREATE+seed in one pass. On a FRESH
+--   database (chora-golden cutover) the table does not exist and this is
+--   a no-op — the migration chain stays truthful for fresh builds.
+-- =============================================================================
+
+DROP TABLE IF EXISTS role_catalog;
