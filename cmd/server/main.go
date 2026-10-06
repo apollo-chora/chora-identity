@@ -530,12 +530,35 @@ func main() {
 	} else {
 		log.Printf("identity: TenantBootstrappedSubscriber DISABLED (no chora_identity pool)")
 	}
-	// In dev these subscribers are kept for direct invocation (e.g., from
-	// the in-memory bus). M12+ binds them via the Cloud Pub/Sub adapter.
-	_ = enrollSub
-	_ = paymentsSub
-	_ = kycFeeSub
-	_ = tenantBootstrappedSub
+	// Cross-domain subscriber bindings (production): each subscriber is
+	// bound to its canonical subject(s) on the NATS JetStream bus as a
+	// durable consumer (at-least-once, DLQ-routed). The handler adapters
+	// (internal/adapter/events/eventbus_bindings.go) decode each producer's
+	// wire format — JSON for chora.delivery.enrollment.created.v1, Protobuf
+	// for the chora.payments.* + chora.tenancy.tenant.bootstrapped.v1
+	// families — onto the subscribers' payload structs.
+	//
+	// In dev (NATS_URL unset) the subscribers stay unbound: the in-memory
+	// bus is publish-only here, so direct invocation remains the dev path.
+	if jetBus != nil {
+		bindSubscription(ctx, jetBus, events.TopicEnrollmentCreated, events.EnrollmentHandler(enrollSub))
+		paymentsHandler := events.PaymentsHandler(paymentsSub)
+		for _, subject := range paymentsSub.SubscribedTopics() {
+			bindSubscription(ctx, jetBus, subject, paymentsHandler)
+		}
+		kycFeeHandler := events.KycFeeHandler(kycFeeSub)
+		for _, subject := range kycFeeSub.SubscribedTopics() {
+			bindSubscription(ctx, jetBus, subject, kycFeeHandler)
+		}
+		if tenantBootstrappedSub != nil {
+			bindSubscription(ctx, jetBus, events.TopicTenancyTenantBootstrappedV1, events.TenantBootstrappedHandler(tenantBootstrappedSub))
+		}
+	} else {
+		_ = enrollSub             // dev: direct invocation only
+		_ = paymentsSub           // dev: direct invocation only
+		_ = kycFeeSub             // dev: direct invocation only
+		_ = tenantBootstrappedSub // dev: direct invocation only
+	}
 
 	// Federated closure-saga pull binding (CHO-1719 / Tier 3 D11): consume
 	// chora.identity.pii.pseudonymise.requested.v1 and run the identity
@@ -556,14 +579,6 @@ func main() {
 	} else {
 		_ = closureSub // dev: direct invocation only
 	}
-	// ⚠ These two say CONSTRUCTED, not wired, and the distinction is the whole
-	// point. Both subscribers are discarded at the `_ =` above: nothing binds
-	// them to a transport, so they consume nothing. Bind them via the event bus
-	// (see closureSub above for the shape) before changing this wording back.
-	log.Printf("identity: PaymentsSubscriber CONSTRUCTED but NOT BOUND to any subscription " +
-		"(chora.payments.user_subscription.* is not consumed by this service)")
-	log.Printf("identity: KycFeeSubscriber CONSTRUCTED but NOT BOUND to any subscription " +
-		"(chora.payments.identity_kyc_fee.* is not consumed by this service)")
 
 	// ── WS-2.1 (per-user Stripe mana top-up) — owner clean-DDD consume seam,
 	// 2026-06-04. chora-identity owns the per-GCID user_mana wallet, so it

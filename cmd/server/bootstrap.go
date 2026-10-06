@@ -132,6 +132,19 @@ func bootstrapBus(ctx context.Context) (eventbus.Bus, func()) {
 	return bus, func() { _ = bus.Close() }
 }
 
+// bindSubscription spawns the durable-consumer goroutine for one subject,
+// mirroring the closure + user_mana_topup bindings in main.go. The consumer
+// name is the subject itself — eventbus.SanitizeConsumerName makes it a
+// legal durable name, and each topic gets its own durable + DLQ this way.
+func bindSubscription(ctx context.Context, bus eventbus.Bus, subject string, handler eventbus.Handler) {
+	go func() {
+		log.Printf("identity: subscriber binding %s", subject)
+		if err := bus.Subscribe(ctx, consumerConfig(subject, subject), handler); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("identity: subscriber %s exited: %v", subject, err)
+		}
+	}()
+}
+
 // consumerConfig is the shared durable-consumer tuning for every
 // chora-identity subscriber: at-least-once with a 30s ack window, five
 // delivery attempts, and the canonical _dlq.<subject> dead-letter routing.
