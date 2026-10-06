@@ -1,132 +1,210 @@
 # chora-identity
 
-Identity service for Chora: GCID (global Chora identity) lifecycle, tenant
-membership mirror, roles, KYC, per-user mana, API keys, WebAuthn passkeys, and
-local username/password authentication.
+## About
 
-The service is designed to run locally with Docker Compose and uses environment
-variables for configuration. No cloud account or managed services (managed SQL,
-message broker, secret manager, identity provider, or CI/CD) are required.
+chora-identity is the Identity service for Chora. It manages GCIDs and tenant membership data, local username/password authentication, WebAuthn passkeys, KYC, per-user mana and subscriptions, API keys, user preferences, and identity-related event publishing. The service exposes HTTP and gRPC interfaces and uses PostgreSQL for durable identity data, with NATS JetStream for local event delivery.
 
-## Local stack
+## Quick start
 
-The default Compose stack contains:
-
-- **chora-identity** — HTTP and gRPC service
-- **PostgreSQL 18** — identity data, durable outbox, and subscriber idempotency
-- **NATS JetStream** — local event publishing and subscriptions (streams provisioned by `nats-init`)
-
-## Requirements
+### Prerequisites
 
 - Docker with Docker Compose
+- Go 1.26.1 or newer for local development outside Docker
 
-## Configuration
-
-Create the local environment file:
-
-```sh
-cp .env.example .env
-```
-
-The checked-in `.env.example` contains the complete local defaults. The actual
-`.env` file is ignored by Git.
-
-Important variables:
-
-| Variable | Purpose | Local default |
-| --- | --- | --- |
-| `PORT` | HTTP port | `8080` |
-| `CHORA_GRPC_PORT` | gRPC port | `9090` |
-| `CHORA_DB_DSN` | PostgreSQL connection string | Compose PostgreSQL |
-| `CHORA_OUTBOX_DSN` | Durable outbox database | Same PostgreSQL instance |
-| `NATS_URL` | NATS JetStream event bus | `nats://nats:4222` |
-| `CHORA_LOCAL_KEK` | Base64 32-byte master KEK for DEK envelope encryption (required) | dev value in `.env.example` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC trace endpoint | `http://otel-collector:4317` |
-
-## Run locally
+### Run the local stack
 
 From the repository root:
 
 ```sh
+cp .env.example .env
 docker compose up --build
 ```
 
-HTTP is exposed on `http://localhost:8080`; gRPC is exposed on port `9090` by
-default.
+The default Compose stack starts:
 
-## Database
+- chora-identity
+- PostgreSQL 18
+- NATS JetStream
+- NATS stream initialization
 
-PostgreSQL is the durable backing store. The same database is also used for the
-transactional outbox and the subscriber idempotency store. Schema changes live
-in `migrations/`.
+The HTTP service is available at `http://localhost:8080`. gRPC listens on port `9090`.
 
-The migrations are applied by the platform migration runner (`scripts/migrate.sh`
-in the orchestrator repository), which mounts this repository's `migrations/`
-directory. Every forward migration is a `*.sql` file that is not a `*.down.sql`.
+The checked-in `.env.example` contains local development defaults. The `.env` file is ignored by Git.
 
-## Event bus
+To seed a local admin after PostgreSQL is available, run the seed command with the required environment variables:
 
-Local messaging uses NATS JetStream. The event taxonomy
-(`chora.{domain}.{aggregate}.{event_type}.v{N}`) is unchanged, and the transport
-is brokered by `github.com/apollo-chora/chora-common/eventbus`.
+```sh
+CHORA_DB_DSN='postgres://chora:chora@localhost:5432/chora_identity?sslmode=disable' \
+CHORA_SEED_TENANT_ID='22222222-2222-7222-8222-222222222222' \
+CHORA_SEED_TENANT_SLUG='chora-local' \
+CHORA_SEED_ADMIN_USERNAME='admin' \
+CHORA_SEED_ADMIN_EMAIL='admin@example.com' \
+CHORA_SEED_ADMIN_PASSWORD='change-me' \
+go run ./cmd/seed
+```
 
-`nats-init` provisions two streams: `CHORA_EVENTS` (subjects `chora.>`) and
-`CHORA_DLQ` (subjects `_dlq.>`, the dead-letter convention). Consumers are
-durable and created on demand by the service. If `NATS_URL` is unset the
-application falls back to its in-memory event bus (publish-only; not durable).
+The seed job is idempotent. It upserts the tenant, user, local Argon2id credential, and active admin membership in one transaction.
 
-## Authentication
+## Usage
 
-Login is local username/password. Credentials are stored in
-`chora_identity.local_credentials` as Argon2id PHC strings
-(`$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>`), with a globally-unique
-normalised username.
+### Health and readiness
+
+```sh
+curl http://localhost:8080/healthz
+curl http://localhost:8080/readyz
+```
+
+`GET /healthz`, `GET /health`, and `GET /readyz` are public. The root endpoint returns service metadata.
+
+### Local username/password authentication
+
+When a PostgreSQL pool is configured, the service exposes:
+
+```http
+POST /v1/auth/verify-credentials
+Content-Type: application/json
+
+{"username":"admin","password":"change-me"}
+```
+
+A successful response contains the GCID, email, authoritative active tenant, roles, and all active tenant memberships. Invalid credentials return `401`; an inactive account returns `403`.
+
+### WebAuthn passkeys
+
+The passkey ceremony is exposed through:
+
+```http
+POST /v1/auth/passkey/challenge
+POST /v1/auth/passkey/register
+POST /v1/auth/passkey/verify
+```
+
+`RP_ID` controls the WebAuthn relying-party ID and defaults to `chora.site`. The challenge TTL is five minutes.
+
+Passkey verification returns the verified GCID and email. Session JWT creation is handled by chora-gateway, not by this service.
+
+By default, passkey credentials use the PostgreSQL-backed repositories when the identity database is available. `CHORA_IDENTITY_PASSKEY_BACKEND=memory` explicitly selects the non-durable in-memory backend for development.
+
+### Identity resolution
+
+```http
+POST /v1/identity/resolve
+Content-Type: application/json
+
+{"email":"admin@example.com","firebase_uid":"subject","active_tenant_id":"<optional-tenant-uuid>"}
+```
+
+This endpoint resolves or creates a GCID and obtains tenant memberships through the chora-tenancy gRPC client. `SVC_TENANCY_GRPC_URL` is required for this path in production.
+
+### Profile and membership HTTP APIs
+
+The service also exposes:
+
+```http
+GET  /me
+GET  /me/roles
+
+POST /api/users
+GET  /api/users/{gcid}
+
+POST /api/memberships
+GET  /api/memberships?tenant_id=&gcid=
+PATCH /api/memberships/{id}/role
+
+POST /api/users/{gcid}/portability/export
+GET  /api/users/{gcid}/portability/snapshots
+```
+
+Protected `/api/*` requests require `X-Tenant-Id` and either `gcid` or `X-Chora-GCID` headers. The `/me` routes use bearer authentication instead.
+
+Additional HTTP surfaces include API keys, tenant IdP provider configuration, tenant member administration, tenant invites, KYC, user preferences, subscriptions, mana, marketplace plans, and the public JWKS endpoint:
+
+```http
+GET /.well-known/jwks.json
+```
+
+The JWKS response uses an ETag and public cache headers.
+
+### gRPC
+
+The gRPC server defaults to port `9090`. It registers the standard gRPC health service plus Chora identity services including:
+
+- `chora.services.identity.v1.Identity`
+- `chora.services.identity.v1.ManaService`
+- `chora.services.identity.v1.ExpRuleService` when the PostgreSQL pool is configured
+- `chora.services.identity.v1.KycService`
+
+The Identity gRPC surface currently implements `GetMe`, which resolves a GCID to its email and display name.
+
+### Configuration
+
+The main local configuration is in `.env.example`.
+
+Common variables include:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CHORA_ENV` | Environment name | `local` |
+| `PORT` | HTTP listen port | `8080` |
+| `CHORA_GRPC_PORT` | Compose-exposed gRPC port | `9090` |
+| `GRPC_PORT` | Process gRPC listen port | `9090` |
+| `CHORA_DB_DSN` | PostgreSQL runtime DSN | local Compose DSN |
+| `CHORA_OUTBOX_DSN` | Transactional outbox DSN | same PostgreSQL database |
+| `NATS_URL` | NATS JetStream URL | `nats://nats:4222` |
+| `CHORA_LOCAL_KEK` | Base64-encoded 32-byte AES-256 master KEK | dev key in `.env.example` |
+| `SVC_TENANCY_GRPC_URL` | chora-tenancy gRPC target | unset locally |
+| `CHORA_PAYMENTS_GRPC_ADDR` | chora-payments gRPC target | unset locally |
+| `RP_ID` | WebAuthn relying-party ID | `chora.site` |
+| `CHORA_IDENTITY_PASSKEY_BACKEND` | Passkey backend | PostgreSQL when available |
+
+`CHORA_LOCAL_KEK` is required at process startup. The value in `.env.example` is for development only; generate a real 32-byte key for a deployment.
+
+PostgreSQL is also used for the transactional outbox when `CHORA_OUTBOX_DSN` is configured. NATS JetStream is used when `NATS_URL` is set; otherwise the service falls back to an in-memory event bus.
+
+## Development
+
+### Build and test
+
+Build the server and seed binaries directly with Go:
+
+```sh
+go build ./cmd/server
+go build ./cmd/seed
+```
+
+Run the test suite:
+
+```sh
+go test ./...
+```
+
+Build the production container from the repository root:
+
+```sh
+docker build -t chora-identity:local .
+```
+
+The Dockerfile builds both `./cmd/server` and `./cmd/seed` and produces a small Alpine-based runtime image.
+
+### Project layout
 
 ```text
-POST /v1/auth/verify-credentials
-{"username":"admin","password":"..."}
+cmd/
+  server/       service entrypoint and composition root
+  seed/         idempotent local-admin provisioning job
+
+internal/
+  adapter/      HTTP, gRPC, PostgreSQL, event, crypto, and integration adapters
+  domain/       identity, authentication, KYC, mana, API key, and related domain logic
+  observability/ tracing and HTTP instrumentation
+
+migrations/     PostgreSQL schema migrations
+config/         runtime configuration data, including the PII closure map
+compose.yaml    local PostgreSQL, NATS, and service stack
+Dockerfile      multi-stage container build
+go.mod          Go module definition
 ```
 
-A successful response carries the authoritative active tenant:
+Database schema changes are stored in `migrations/`. Forward migrations are the `*.up.sql` files and are applied in filename order by the platform migration runner.
 
-```json
-{
-  "gcid": "<uuid>",
-  "email": "<string>",
-  "active_tenant_id": "<uuid>",
-  "active_tenant_roles": ["<role>"],
-  "memberships": [{"tenant_id": "<uuid>", "roles": ["<role>"]}]
-}
-```
-
-`401 INVALID_CREDENTIALS` is returned for an unknown username, a wrong password,
-or a user with no active tenant membership. `403 ACCOUNT_DISABLED` is returned
-for a non-active user.
-
-### Seeding a local admin
-
-`cmd/seed` is an idempotent job that upserts a tenant, a user, the credential,
-and an active admin membership from environment variables. Re-running is a
-no-op; the stored Argon2id hash is only rewritten when it no longer verifies
-against `CHORA_SEED_ADMIN_PASSWORD`.
-
-```env
-CHORA_SEED_TENANT_ID=<uuid>
-CHORA_SEED_TENANT_SLUG=chora-local
-CHORA_SEED_ADMIN_USERNAME=admin
-CHORA_SEED_ADMIN_EMAIL=admin@example.com
-CHORA_SEED_ADMIN_PASSWORD=<password>
-```
-
-## Envelope encryption
-
-Per-user data encryption keys (DEKs) are wrapped with a local master KEK
-(`CHORA_LOCAL_KEK`, base64 of 32 bytes) using AES-256-GCM. Only the wrapped form
-is persisted (`chora_identity.user_dek_wrap`); crypto-shred tombstones the row.
-A missing or malformed KEK is a hard boot error — envelope encryption is never
-silently disabled.
-
-## Migrations
-
-Forward migrations are applied in filename order. New credentials/membership
-tables are added by `migrations/0042_local_credentials.up.sql`.
+For local development, the Compose stack provisions the `CHORA_EVENTS` and `CHORA_DLQ` JetStream streams expected by the service.
