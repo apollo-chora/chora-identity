@@ -1,6 +1,0 @@
-﻿Tenant_Slug,Tenant_Name,Hosting_Mode,Country,Currency,EMAIL,Display_Name,ROLES,External_Ref,Locale,Send_Invite
-acme-college,"Acme College, Pte Ltd",FRANCHISE,sg,sgd,Alice@Acme.SG,"Tan, Alice",Learner|AUTHOR,00042,en-SG,TRUE
-acme-college,"Acme College, Pte Ltd",,,,bob@acme.sg,Bob Lim,tenant_admin|instructor,00043,,false
-acme-college,"Acme College, Pte Ltd",,,,carol@acme.sg,,training_admin,,,
-acme-college,"Acme College, Pte Ltd",,,,dave@acme.sg,,ADMIN|tenant_admin|admin,,,
-

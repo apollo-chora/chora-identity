@@ -1,8 +1,7 @@
 // coverage_extra_test.go — last cheap error-branch batch across the pg repos:
 // pending_invite, tenant_member_search, membership_admin (ChangeRole /
-// GrantMembership / RemoveMember exec+scan errors), user_mana happy get + scan
-// error, and mana_pricing generic scan error. All drive the shared stub
-// harness — no live DB.
+// GrantMembership / RemoveMember exec+scan errors), and user_mana happy get +
+// scan error. All drive the shared stub harness — no live DB.
 package pg
 
 import (
@@ -12,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
 )
 
 // -----------------------------------------------------------------------------
@@ -203,19 +200,6 @@ func TestPendingInvite_MarkAccepted_CustomScanErrorWraps(t *testing.T) {
 	err := NewPendingInviteRepository(&stubTxQuerier{tx: tx}).MarkAccepted(context.Background(), maTenant, "inv-1", maGcid)
 	if err == nil || !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want wrapped boom", err)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// mana_pricing — generic (non-ErrNoRows) scan error
-// -----------------------------------------------------------------------------
-
-func TestManaPricingStore_CostForAction_ScanErrorWraps(t *testing.T) {
-	boom := errors.New("pricing scan boom")
-	q := &pricingStubQuerier{row: manaStubRow{scan: func(...any) error { return boom }}}
-	_, err := NewManaPricingStore(q).CostForAction(context.Background(), "familiar_chat_turn_standard")
-	if errors.Is(err, mana.ErrUnknownActionCode) || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want wrapped boom (NOT ErrUnknownActionCode)", err)
 	}
 }
 

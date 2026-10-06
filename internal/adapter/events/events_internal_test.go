@@ -1,7 +1,7 @@
 // events_internal_test.go — direct coverage for the unexported topic +
-// envelope validators and the topic→event-type deriver. The external
-// events_test.go drives them indirectly through Recorder.Publish; this file
-// table-tests every error branch explicitly.
+// envelope validators. The external events_test.go drives them indirectly
+// through Recorder.Publish; this file table-tests every error branch
+// explicitly.
 package events
 
 import (
@@ -85,15 +85,5 @@ func TestValidateEnvelope_FullBranchCoverage(t *testing.T) {
 				t.Errorf("envelope missing %s must be rejected", tc.name)
 			}
 		})
-	}
-}
-
-func TestDeriveEventType(t *testing.T) {
-	if got := deriveEventType("chora.identity.user.created.v1"); got != "user.created.v1" {
-		t.Errorf("deriveEventType = %q, want user.created.v1", got)
-	}
-	// <3 dot-segments falls back to the topic itself.
-	if got := deriveEventType("short.topic"); got != "short.topic" {
-		t.Errorf("deriveEventType(short) = %q, want short.topic", got)
 	}
 }

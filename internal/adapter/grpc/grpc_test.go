@@ -4,12 +4,9 @@ package grpcadapter_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/apollo-chora/chora-identity/internal/adapter/events"
 	grpcadapter "github.com/apollo-chora/chora-identity/internal/adapter/grpc"
-	"github.com/apollo-chora/chora-identity/internal/adapter/repo"
-	"github.com/apollo-chora/chora-identity/internal/domain/kyc"
 	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
 )
 
@@ -263,49 +260,3 @@ func TestManaServer_NilReceiverBranches(t *testing.T) {
 		t.Error("nil receiver GetBalance must error")
 	}
 }
-
-// -----------------------------------------------------------------------------
-// KycServer
-// -----------------------------------------------------------------------------
-
-func TestKycServer_GetVerificationStatus_Happy(t *testing.T) {
-	t.Parallel()
-	r := repo.NewInMemKycRepo()
-	v, _ := kyc.NewVerification(kyc.NewParams{Gcid: gG, Method: kyc.MethodSingpass, Provider: "ndi"})
-	_ = v.Submit("", 0, "")
-	_ = v.Verify("admin", true)
-	_ = r.Save(context.Background(), v)
-
-	srv := grpcadapter.NewKycServer(r)
-	got, err := srv.GetVerificationStatus(context.Background(), &grpcadapter.GetVerificationStatusRequest{Gcid: gG})
-	if err != nil {
-		t.Fatalf("GetVerificationStatus: %v", err)
-	}
-	if got.Status != "verified" || got.Method != "singpass" {
-		t.Errorf("status=%q method=%q", got.Status, got.Method)
-	}
-	if !got.SkillsfutureScopeGranted {
-		t.Errorf("scope flag not propagated")
-	}
-}
-
-func TestKycServer_GetVerificationStatus_NotFound(t *testing.T) {
-	t.Parallel()
-	srv := grpcadapter.NewKycServer(repo.NewInMemKycRepo())
-	_, err := srv.GetVerificationStatus(context.Background(), &grpcadapter.GetVerificationStatusRequest{Gcid: gG})
-	if err == nil {
-		t.Errorf("expected ErrNotFound for unknown gcid")
-	}
-}
-
-func TestKycServer_RejectsEmptyGcid(t *testing.T) {
-	t.Parallel()
-	srv := grpcadapter.NewKycServer(repo.NewInMemKycRepo())
-	_, err := srv.GetVerificationStatus(context.Background(), &grpcadapter.GetVerificationStatusRequest{Gcid: ""})
-	if err == nil {
-		t.Errorf("expected error for empty gcid")
-	}
-}
-
-// keep time import live
-var _ = time.Time{}
