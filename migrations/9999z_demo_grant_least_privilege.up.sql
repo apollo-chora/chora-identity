@@ -20,6 +20,13 @@
 --     * SELECT on public.demo_grant_budget to the read-only role (via the
 --       default privileges for tables created by chora_identity_migrate).
 --
+--   It also trims the ONE write privilege the blanket grant gives the
+--   runtime role that the demo-grant credit path never uses: DELETE (and
+--   TRUNCATE) on public.demo_grant_budget. The credit path only ever INSERTs
+--   a lazy per-GCID row and UPDATEs the consumed columns; a DELETE on the
+--   counters is a budget-manipulation vector, so the runtime role is left
+--   with exactly SELECT, INSERT, UPDATE.
+--
 --   0044 cannot fix that on a fresh install (it runs first) and 9999 cannot be
 --   edited (it is already applied on live databases, and the migration runner
 --   rejects a modified file by SHA-256). So the least-privilege posture is
@@ -55,6 +62,10 @@ BEGIN
         END IF;
         IF to_regclass('public.demo_grant_budget') IS NOT NULL THEN
             EXECUTE 'GRANT SELECT, INSERT, UPDATE ON public.demo_grant_budget TO chora_identity_app_rw';
+            -- The blanket grant in 9999 also gave app_rw DELETE on every table.
+            -- The credit path never deletes a counter row; take it back so the
+            -- runtime role holds exactly the write set the aggregate needs.
+            EXECUTE 'REVOKE DELETE, TRUNCATE ON public.demo_grant_budget FROM chora_identity_app_rw';
         END IF;
     END IF;
 END $$;
@@ -67,4 +78,6 @@ END $$;
 --            'public.mana_demo_grant_total_units()', 'EXECUTE');   -- expect: t
 --   SELECT has_table_privilege('chora_identity_app_ro',
 --            'public.demo_grant_budget', 'SELECT');                -- expect: f
+--   SELECT has_table_privilege('chora_identity_app_rw',
+--            'public.demo_grant_budget', 'DELETE');                -- expect: f
 -- =============================================================================

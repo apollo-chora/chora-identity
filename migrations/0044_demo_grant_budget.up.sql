@@ -25,7 +25,12 @@
 --        interactive budget the demo button draws from. This is why the two
 --        uses of `demo_grant` do not collide even though they share the reason.
 --
---     2. The hardened `mana_demo_grant_total_units()` helper. Migration 0043
+--     2. Reconciliation of the counters with the demo_grant rows that PREDATE
+--        this migration (see 1b below): on a live database upgraded in place,
+--        every interactive demo_grant row is charged and every seed row is
+--        not, so the counters end up consistent with the ledger.
+--
+--     3. The hardened `mana_demo_grant_total_units()` helper. Migration 0043
 --        created it with `SET search_path = public, pg_temp`, an unqualified
 --        body, the default (migration-role) owner and EXECUTE for the
 --        read-only `chora_identity_app_ro` role. 0043 is already applied on
@@ -46,7 +51,8 @@
 --          * EXECUTE for `chora_identity_app_rw` only: revoked from PUBLIC and
 --            from the read-only `chora_identity_app_ro`.
 --
---   Idempotent: CREATE TABLE IF NOT EXISTS / ON CONFLICT DO NOTHING /
+--   Idempotent: CREATE TABLE IF NOT EXISTS / ON CONFLICT DO UPDATE (the
+--   reconciliation re-asserts counters == interactive ledger rows) /
 --   CREATE OR REPLACE FUNCTION / role-existence guards. 9999_grant_app_roles.sql
 --   re-grants EXECUTE on every function in schema public to app_rw AND app_ro
 --   and runs LAST in lex order, so the app_ro revoke is re-asserted by
@@ -82,8 +88,45 @@ COMMENT ON COLUMN demo_grant_budget.consumed_units IS
     'Demo-grant units already committed. Never reset downwards; a grant is charged only after its ledger row is written, in the same transaction.';
 
 -- The platform-wide row always exists, so the credit path only ever locks it.
-INSERT INTO demo_grant_budget (budget_key) VALUES ('global')
-ON CONFLICT (budget_key) DO NOTHING;
+--
+-- -----------------------------------------------------------------------------
+-- 1b. Reconcile the counters with the demo_grant rows that PREDATE this
+--     migration.
+--
+-- 0044 is applied on live databases that may ALREADY carry demo_grant ledger
+-- rows: the one-time seed grant (cmd/seed) and — if the endpoint was enabled
+-- between 0043 and 0044 — interactive grants. Seed rows are excluded by
+-- design (the seed must never eat the interactive budget — see the note on
+-- demo_grant_budget above); every other demo_grant row is an interactive
+-- grant and MUST be charged, otherwise this migration would silently reset
+-- the budget to 0 and hand already-granted mana back to every caller.
+--
+-- ON CONFLICT DO UPDATE, not DO NOTHING: the ledger is the only source of
+-- truth for what has been granted, so re-asserting the invariant
+-- (counters == interactive ledger rows) on re-run is the correct behaviour.
+-- -----------------------------------------------------------------------------
+
+WITH interactive AS (
+    SELECT l.gcid, sum(l.units)::bigint AS units, count(*) AS grants
+      FROM public.mana_ledger AS l
+     WHERE l.reason = 'demo_grant'::public.mana_reason
+       AND l.idempotency_key NOT LIKE 'demo-seed:v1:%'
+     GROUP BY l.gcid
+),
+reconciled AS (
+    SELECT 'gcid:'::text || i.gcid::text AS budget_key, i.units, i.grants
+      FROM interactive AS i
+    UNION ALL
+    SELECT 'global'::text, COALESCE(sum(i.units), 0), COALESCE(sum(i.grants), 0)
+      FROM interactive AS i
+)
+INSERT INTO demo_grant_budget (budget_key, consumed_units, consumed_grants)
+SELECT r.budget_key, r.units, r.grants
+  FROM reconciled AS r
+ON CONFLICT (budget_key) DO UPDATE SET
+    consumed_units  = EXCLUDED.consumed_units,
+    consumed_grants = EXCLUDED.consumed_grants,
+    updated_at      = now();
 
 -- Runtime privileges: the app role must read, create (lazily, for a first-time
 -- GCID) and charge both rows. Nothing else may touch them.
@@ -168,8 +211,8 @@ COMMIT;
 
 -- =============================================================================
 -- VERIFICATION (run manually after apply, with the migrate DSN):
---   SELECT * FROM demo_grant_budget;                       -- expect the 'global' row, 0/0
---   SELECT mana_demo_grant_total_units();                  -- expect the demo_grant total
+--   SELECT * FROM demo_grant_budget;                       -- the 'global' row + one row per GCID with pre-0044 INTERACTIVE grants; seed-only GCIDs have no row
+--   SELECT mana_demo_grant_total_units();                  -- the demo_grant total (seed rows included)
 --   \df+ public.mana_demo_grant_total_units                 -- owner + ACL
 --   SELECT proconfig FROM pg_proc WHERE proname = 'mana_demo_grant_total_units';
 --   -- expect: {search_path=pg_catalog, pg_temp}

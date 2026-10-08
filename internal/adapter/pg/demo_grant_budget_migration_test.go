@@ -55,12 +55,27 @@ func TestMigration0044_DemoGrantBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("seeds_the_global_row", func(t *testing.T) {
-		if !regexp.MustCompile(`(?i)INSERT\s+INTO\s+` + demoBudgetTableName + `[^;]*'global'`).MatchString(up) {
-			t.Errorf("0044.up must insert the 'global' budget row")
+	t.Run("reconciles_the_counters_with_preexisting_ledger_rows", func(t *testing.T) {
+		// A live database upgraded in place may already carry demo_grant rows.
+		// The migration must charge every interactive row and none of the
+		// seed rows, so the counters end up consistent with the ledger.
+		if !regexp.MustCompile(`(?i)INSERT\s+INTO\s+` + demoBudgetTableName).MatchString(up) {
+			t.Errorf("0044.up must backfill %s from the ledger", demoBudgetTableName)
 		}
-		if !regexp.MustCompile(`(?i)ON\s+CONFLICT[^;]*DO\s+NOTHING`).MatchString(up) {
-			t.Errorf("0044.up must make the global row insert idempotent (ON CONFLICT DO NOTHING)")
+		if !strings.Contains(up, "'global'") {
+			t.Errorf("0044.up must reconcile the 'global' budget row")
+		}
+		if !strings.Contains(up, "public.mana_ledger") || !strings.Contains(up, "mana_reason") {
+			t.Errorf("0044.up must read the demo_grant rows from mana_ledger")
+		}
+		// The seed grant shares the reason but must NOT be charged.
+		if !strings.Contains(up, "NOT LIKE 'demo-seed:v1:%'") {
+			t.Errorf("0044.up must exclude the seed grant's idempotency-key prefix from the reconciliation")
+		}
+		// The ledger is the source of truth: re-running re-asserts the
+		// invariant rather than leaving a half-reconciled counter behind.
+		if !regexp.MustCompile(`(?i)ON\s+CONFLICT[^;]*DO\s+UPDATE`).MatchString(up) {
+			t.Errorf("0044.up must use ON CONFLICT DO UPDATE so re-runs re-assert counters == interactive ledger rows")
 		}
 	})
 
@@ -180,6 +195,16 @@ func TestMigration9999z_DemoGrantLeastPrivilege(t *testing.T) {
 		}
 		if !regexp.MustCompile(`(?i)GRANT\s+SELECT,\s*INSERT,\s*UPDATE\s+ON\s+public\.` + demoBudgetTableName + `\s+TO\s+chora_identity_app_rw`).MatchString(up) {
 			t.Errorf("9999z must (re-)grant the budget table to chora_identity_app_rw")
+		}
+	})
+
+	t.Run("trims_the_runtime_role_to_the_credit_paths_write_set", func(t *testing.T) {
+		// 9999's blanket grant gives app_rw DELETE on every table. The
+		// demo-grant credit path only ever INSERTs a lazy row and UPDATEs the
+		// consumed columns, so a DELETE on the counters is a manipulation
+		// vector and must be taken back here.
+		if !regexp.MustCompile(`(?i)REVOKE\s+DELETE,\s*TRUNCATE\s+ON\s+public\.` + demoBudgetTableName + `\s+FROM\s+chora_identity_app_rw`).MatchString(up) {
+			t.Errorf("9999z must revoke DELETE, TRUNCATE on %s from chora_identity_app_rw", demoBudgetTableName)
 		}
 	})
 
