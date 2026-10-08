@@ -22,14 +22,16 @@ import (
 type faultStore struct {
 	*mana.InMemoryStore
 
-	getManaErr  error
-	saveManaErr error
-	listAlloc   error
-	saveAlloc   error
-	updateAlloc error
-	appendLed   error
-	findKeyErr  error
-	listLedErr  error
+	getManaErr   error
+	saveManaErr  error
+	listAlloc    error
+	saveAlloc    error
+	updateAlloc  error
+	appendLed    error
+	findKeyErr   error
+	listLedErr   error
+	creditWalErr error
+	sumReasonErr error
 }
 
 func (s *faultStore) GetMana(ctx context.Context, gcid string) (*mana.UserMana, error) {
@@ -86,6 +88,20 @@ func (s *faultStore) ListLedger(ctx context.Context, f mana.LedgerFilter) ([]*ma
 		return nil, s.listLedErr
 	}
 	return s.InMemoryStore.ListLedger(ctx, f)
+}
+
+func (s *faultStore) CreditWallet(ctx context.Context, in mana.CreditWalletInput) (*mana.CreditWalletResult, error) {
+	if s.creditWalErr != nil {
+		return nil, s.creditWalErr
+	}
+	return s.InMemoryStore.CreditWallet(ctx, in)
+}
+
+func (s *faultStore) SumLedgerUnitsByReason(ctx context.Context, reason mana.Reason) (int64, error) {
+	if s.sumReasonErr != nil {
+		return 0, s.sumReasonErr
+	}
+	return s.InMemoryStore.SumLedgerUnitsByReason(ctx, reason)
 }
 
 func newFaultStore() *faultStore {
@@ -467,20 +483,25 @@ func TestQuoter_CreditMana_StoreErrors(t *testing.T) {
 		t.Error("expected SaveAllocation error on subsidy credit")
 	}
 
-	// SaveMana error (personal path).
+	// CreditWallet error (personal path). The personal-balance credit now goes
+	// through the atomic primitive, so the fault moves with it.
 	store3 := newFaultStore()
-	store3.saveManaErr = errors.New("save mana down")
+	store3.creditWalErr = errors.New("credit wallet down")
 	q3 := mana.NewQuoter(store3)
 	if _, err := q3.CreditMana(ctx, mana.CreditInput{Gcid: "g", Source: mana.SourceTopup, Units: 5, Reason: mana.ReasonTopup, IdempotencyKey: "k"}); err == nil {
-		t.Error("expected SaveMana error on credit")
+		t.Error("expected CreditWallet error on credit")
 	}
 
-	// AppendLedger error.
+	// AppendLedger error (subsidy path — still a separate write there).
 	store4 := newFaultStore()
 	store4.appendLed = errors.New("append down")
 	q4 := mana.NewQuoter(store4)
-	if _, err := q4.CreditMana(ctx, mana.CreditInput{Gcid: "g", Source: mana.SourceTopup, Units: 5, Reason: mana.ReasonTopup, IdempotencyKey: "k"}); err == nil {
-		t.Error("expected AppendLedger error on credit")
+	if _, err := q4.CreditMana(ctx, mana.CreditInput{
+		Gcid: "g", Source: mana.SourceTenantSubsidy, Units: 50,
+		Reason: mana.ReasonTenantSubsidy, IdempotencyKey: "k-subsidy-ledger",
+		TenantID: "t", SourceAllocationID: "alloc-explicit",
+	}); err == nil {
+		t.Error("expected AppendLedger error on subsidy credit")
 	}
 }
 
@@ -888,5 +909,207 @@ func TestQuoter_DeductMana_FifoComparator_ExpBeforeNilInsertion(t *testing.T) {
 	// Sorted: exp-a (1h), exp-c (2h), then nil-b.
 	if res.Entries[0].SourceAllocationID != "exp-a" || res.Entries[1].SourceAllocationID != "exp-c" || res.Entries[2].SourceAllocationID != "nil-b" {
 		t.Errorf("FIFO order = %+v", res.Entries)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// CreditWallet (atomic credit primitive)
+// -----------------------------------------------------------------------------
+
+func TestInMemoryStore_CreditWallet_AppendsLedgerAndCredits(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	res, err := store.CreditWallet(context.Background(), mana.CreditWalletInput{
+		Gcid: "g", Units: 500, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "cw-1",
+	})
+	if err != nil {
+		t.Fatalf("CreditWallet: %v", err)
+	}
+	if res.Replayed {
+		t.Fatal("first credit must not report a replay")
+	}
+	if res.Entry == nil || res.Entry.IdempotencyKey != "cw-1" {
+		t.Fatalf("entry = %+v, want the appended row", res.Entry)
+	}
+	if res.BalanceAfterUnits != 500 {
+		t.Errorf("BalanceAfterUnits = %d, want 500", res.BalanceAfterUnits)
+	}
+	m, err := store.GetMana(context.Background(), "g")
+	if err != nil {
+		t.Fatalf("GetMana: %v", err)
+	}
+	if m.BalanceUnits != 500 || m.LifetimeEarned != 500 {
+		t.Errorf("wallet = %d/%d earned, want 500/500", m.BalanceUnits, m.LifetimeEarned)
+	}
+	if m.Version != 2 {
+		t.Errorf("version = %d, want 2", m.Version)
+	}
+	if m.LastCreditedAt == nil {
+		t.Error("last_credited_at not set")
+	}
+}
+
+func TestInMemoryStore_CreditWallet_IdempotentReplay(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	ctx := context.Background()
+	in := mana.CreditWalletInput{
+		Gcid: "g", Units: 500, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "cw-replay",
+	}
+	if _, err := store.CreditWallet(ctx, in); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// Spend some, then replay: the balance must NOT be topped back up.
+	m, _ := store.GetMana(ctx, "g")
+	if err := m.Debit(200); err != nil {
+		t.Fatalf("debit: %v", err)
+	}
+	if err := store.SaveMana(ctx, m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	res, err := store.CreditWallet(ctx, in)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !res.Replayed {
+		t.Fatal("replay must report Replayed=true")
+	}
+	if res.BalanceAfterUnits != 300 {
+		t.Errorf("BalanceAfterUnits = %d, want 300 (the spent balance)", res.BalanceAfterUnits)
+	}
+	entries, _ := store.FindLedgerByIdempotencyKey(ctx, "g", "cw-replay")
+	if len(entries) != 1 {
+		t.Errorf("ledger rows = %d, want 1", len(entries))
+	}
+}
+
+func TestInMemoryStore_CreditWallet_DistinctKeysBothCredit(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	ctx := context.Background()
+	base := mana.CreditWalletInput{
+		Gcid: "g", Units: 500, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant,
+	}
+	first := base
+	first.IdempotencyKey = "cw-a"
+	second := base
+	second.IdempotencyKey = "cw-b"
+
+	if _, err := store.CreditWallet(ctx, first); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	res, err := store.CreditWallet(ctx, second)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if res.Replayed {
+		t.Fatal("a distinct key must not replay")
+	}
+	m, _ := store.GetMana(ctx, "g")
+	if m.BalanceUnits != 1000 {
+		t.Errorf("balance = %d, want 1000", m.BalanceUnits)
+	}
+}
+
+func TestInMemoryStore_CreditWallet_Validation(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	base := mana.CreditWalletInput{
+		Gcid: "g", Units: 5, Direction: mana.DirectionCredit,
+		Reason: mana.ReasonPromo, IdempotencyKey: "cw-v",
+	}
+	if _, err := store.CreditWallet(context.Background(), base); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	cases := map[string]func(*mana.CreditWalletInput){
+		"empty gcid":        func(in *mana.CreditWalletInput) { in.Gcid = "" },
+		"zero units":        func(in *mana.CreditWalletInput) { in.Units = 0 },
+		"invalid direction": func(in *mana.CreditWalletInput) { in.Direction = "x" },
+		"invalid reason":    func(in *mana.CreditWalletInput) { in.Reason = "x" },
+		"empty key":         func(in *mana.CreditWalletInput) { in.IdempotencyKey = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			mutate(&in)
+			if _, err := store.CreditWallet(context.Background(), in); err == nil {
+				t.Fatalf("CreditWallet(%s) err = nil, want error", name)
+			}
+		})
+	}
+}
+
+func TestInMemoryStore_SumLedgerUnitsByReason(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	ctx := context.Background()
+	credit := func(gcid, key string, units int64) {
+		t.Helper()
+		if _, err := store.CreditWallet(ctx, mana.CreditWalletInput{
+			Gcid: gcid, Units: units, Direction: mana.DirectionMint,
+			Reason: mana.ReasonDemoGrant, IdempotencyKey: key,
+		}); err != nil {
+			t.Fatalf("credit %s: %v", key, err)
+		}
+	}
+	credit("g-a", "s-1", 100)
+	credit("g-b", "s-2", 250)
+	credit("g-a", "s-3", 50)
+
+	if got := mustSum(t, store, mana.ReasonDemoGrant); got != 400 {
+		t.Errorf("demo_grant total = %d, want 400", got)
+	}
+	if got := mustSum(t, store, mana.ReasonTopup); got != 0 {
+		t.Errorf("topup total = %d, want 0", got)
+	}
+	if _, err := store.SumLedgerUnitsByReason(ctx, "nope"); err == nil {
+		t.Fatal("an unknown reason must error")
+	}
+}
+
+func mustSum(t *testing.T, store *mana.InMemoryStore, reason mana.Reason) int64 {
+	t.Helper()
+	got, err := store.SumLedgerUnitsByReason(context.Background(), reason)
+	if err != nil {
+		t.Fatalf("SumLedgerUnitsByReason(%s): %v", reason, err)
+	}
+	return got
+}
+
+func TestValidateCreditWalletInput(t *testing.T) {
+	t.Parallel()
+	base := mana.CreditWalletInput{
+		Gcid: "g", Units: 5, Direction: mana.DirectionCredit,
+		Reason: mana.ReasonPromo, IdempotencyKey: "k",
+	}
+	if err := mana.ValidateCreditWalletInput(base); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	bad := base
+	bad.Units = 0
+	if err := mana.ValidateCreditWalletInput(bad); err == nil {
+		t.Error("zero units must be rejected")
+	}
+	bad = base
+	bad.IdempotencyKey = " "
+	if err := mana.ValidateCreditWalletInput(bad); err == nil {
+		t.Error("a blank idempotency key must be rejected")
+	}
+}
+
+func TestReasonDemoGrant_IsValidAndDistinctFromTopup(t *testing.T) {
+	t.Parallel()
+	if !mana.ReasonDemoGrant.Valid() {
+		t.Error("demo_grant must be a valid reason")
+	}
+	if mana.ReasonDemoGrant == mana.ReasonTopup {
+		t.Fatal("demo_grant must be distinct from topup (a paid purchase)")
+	}
+	if string(mana.ReasonDemoGrant) != "demo_grant" {
+		t.Errorf("demo_grant = %q", mana.ReasonDemoGrant)
 	}
 }

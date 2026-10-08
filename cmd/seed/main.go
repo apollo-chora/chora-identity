@@ -41,6 +41,10 @@
 //	CHORA_SEED_STUDENT_EMAIL        — student email (required when username set)
 //	CHORA_SEED_STUDENT_PASSWORD     — student password (required when username set)
 //
+// Every seeded account also receives the demo mana grant (see
+// applyDemoSeedGrant) inside the same transaction, so a demo never has to run
+// a real payment/top-up flow.
+//
 // Usage:
 //
 //	CHORA_DB_DSN=... CHORA_SEED_TENANT_ID=... ... go run ./cmd/seed
@@ -61,8 +65,17 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/apollo-chora/chora-identity/internal/adapter/pg"
 	"github.com/apollo-chora/chora-identity/internal/domain/authn"
 	"github.com/apollo-chora/chora-identity/internal/domain/identity"
+)
+
+const (
+	// demoSeedGrantUnits is the demo balance every seeded account starts with.
+	demoSeedGrantUnits = int64(1_000_000_000)
+	// demoSeedGrantPrefix makes the seed's idempotency key deterministic, so a
+	// re-run is a no-op rather than a second grant.
+	demoSeedGrantPrefix = "demo-seed:v1:"
 )
 
 // seedNamespace is the fixed UUIDv5 namespace for deterministic seed GCIDs.
@@ -351,6 +364,46 @@ func upsertUser(ctx context.Context, tx pgx.Tx, tenantID string, u seedUser) err
 		membershipID(gcid, tenantID, string(u.Role)), gcid, tenantID, string(u.Role),
 	); err != nil {
 		return fmt.Errorf("upsert membership: %w", err)
+	}
+
+	return applyDemoSeedGrant(ctx, pg.NewTxBridge(tx), gcid)
+}
+
+// demoSeedGrantKey derives the deterministic demo-grant idempotency key for a
+// seeded account. Because it is stable across runs, a re-run finds the existing
+// ledger row and credits nothing.
+func demoSeedGrantKey(gcid string) string {
+	return demoSeedGrantPrefix + gcid
+}
+
+// applyDemoSeedGrant credits a seeded wallet with the demo balance, inside the
+// seed transaction.
+//
+// ADDITIVE + IDEMPOTENT. The idempotency key is deterministic
+// (`demo-seed:v1:<gcid>`), so on a re-run the in-transaction re-check finds the
+// existing ledger row and does NOTHING: the grant is never re-added, and a
+// balance the user has since spent is never reset. Because the credit and the
+// ledger row are written by the same atomic primitive that the seed tx wraps, a
+// seed failure rolls the grant back too — a failed seed changes neither.
+//
+// The grant is a free demo mint (direction mint, reason demo_grant), NOT a
+// `topup`: `topup` means a paid purchase, and reusing it would mislabel free
+// demo mana as revenue-bearing.
+func applyDemoSeedGrant(ctx context.Context, tx pg.Tx, gcid string) error {
+	// Scope the write to this user. The seed DSN is the table owner and so
+	// bypasses RLS, but setting the GUC keeps the grant correct for EVERY
+	// seeded user even if the DSN ever becomes the NOBYPASSRLS app role.
+	if err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL chora.user_gcid = '%s'", gcid)); err != nil {
+		return fmt.Errorf("set user guc: %w", err)
+	}
+	res, err := pg.SeedDemoGrant(ctx, tx, gcid, demoSeedGrantKey(gcid), demoSeedGrantUnits)
+	if err != nil {
+		return fmt.Errorf("demo seed grant: %w", err)
+	}
+	if res != nil && res.Replayed {
+		// Already applied by an earlier run — nothing was credited.
+		log.Printf("seed: demo grant already applied for gcid=%s (idempotency_key=%s) — skipped",
+			gcid, demoSeedGrantPrefix+gcid)
 	}
 	return nil
 }

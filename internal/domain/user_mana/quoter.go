@@ -26,6 +26,17 @@ type Store interface {
 	ListAllocations(ctx context.Context, gcid string) ([]*Allocation, error)
 	SaveAllocation(ctx context.Context, gcid string, a *Allocation) error
 	UpdateAllocationRemaining(ctx context.Context, gcid, allocationID string, remaining int64) error
+	// CreditWallet applies a personal-balance credit and the matching ledger
+	// row. Implementations MUST make the wallet write and the ledger insert
+	// ATOMIC (one transaction) so a crash cannot leave balance != ledger, and
+	// MUST honour (gcid, idempotency_key): a repeat call returns Replayed=true
+	// without crediting again.
+	CreditWallet(ctx context.Context, in CreditWalletInput) (*CreditWalletResult, error)
+	// SumLedgerUnitsByReason totals `reason` across ALL GCIDs. This is the
+	// cross-user budget axis: an RLS-scoped implementation can only see the
+	// caller's own rows, so the pg adapter reads it through a SECURITY DEFINER
+	// helper (migration 0043).
+	SumLedgerUnitsByReason(ctx context.Context, reason Reason) (int64, error)
 }
 
 // Quoter is the domain service for credit/debit Mana operations.
@@ -438,6 +449,62 @@ type CreditResult struct {
 	Replayed          bool
 }
 
+// CreditWalletInput is the input for an atomic wallet credit (Store.CreditWallet).
+//
+// It is the persistence-layer counterpart of CreditInput for the paths that
+// touch ONLY the personal balance — mints, grants, promos, refunds, rollovers.
+// The tenant-subsidy path keeps using CreditInput because it also writes an
+// Allocation row outside the wallet.
+type CreditWalletInput struct {
+	Gcid                 string
+	Units                int64
+	Direction            Direction
+	Reason               Reason
+	IdempotencyKey       string
+	RequestID            string
+	SourceSubscriptionID string
+	SourceActionID       string
+	SourceAllocationID   string
+	SourceTopupID        string
+}
+
+// CreditWalletResult is the outcome of an atomic wallet credit.
+type CreditWalletResult struct {
+	// Wallet is the post-credit wallet snapshot (nil only on a replay of a
+	// grant whose wallet row has since been removed — not reachable today).
+	Wallet *UserMana
+	// Entry is the appended ledger row, or the pre-existing row on a replay.
+	Entry *LedgerEntry
+	// BalanceAfterUnits is subsidy total + personal balance, matching
+	// Entry.BalanceAfterUnits.
+	BalanceAfterUnits int64
+	// Replayed reports that the idempotency key had already been applied and
+	// that NO credit was made.
+	Replayed bool
+}
+
+// ValidateCreditWalletInput enforces the invariants every CreditWallet
+// implementation relies on, so the pg and in-memory adapters reject the same
+// inputs for the same reasons.
+func ValidateCreditWalletInput(in CreditWalletInput) error {
+	if err := validateGcid(in.Gcid); err != nil {
+		return err
+	}
+	if err := validateUnits(in.Units); err != nil {
+		return err
+	}
+	if !in.Direction.Valid() {
+		return fmt.Errorf("user_mana: invalid direction %q", in.Direction)
+	}
+	if !in.Reason.Valid() {
+		return fmt.Errorf("user_mana: invalid reason %q", in.Reason)
+	}
+	if strings.TrimSpace(in.IdempotencyKey) == "" {
+		return errors.New("user_mana: idempotency_key required")
+	}
+	return nil
+}
+
 // CreditMana adds units to the user's wallet. For Source=tenant_subsidy a
 // new Allocation is also stored so the FIFO Quoter can drain it later.
 //
@@ -511,42 +578,60 @@ func (q *Quoter) CreditMana(ctx context.Context, in CreditInput) (*CreditResult,
 		// touch version
 		mana.UpdatedAt = now
 		mana.Version++
-	} else {
-		if err := mana.Credit(in.Units); err != nil {
+
+		// The subsidy is a separate Allocation pool, NOT personal balance, so
+		// it does not go through CreditWallet. SaveMana + AppendLedger stay
+		// separate here (two-table projection, not a single-account mutation).
+		if err := q.store.SaveMana(ctx, mana); err != nil {
 			return nil, err
 		}
+		allocs, _ := q.store.ListAllocations(ctx, in.Gcid)
+		subsidy := int64(0)
+		for _, a := range allocs {
+			subsidy += a.RemainingUnits
+		}
+		balAfter := subsidy + mana.BalanceUnits
+		e, err := NewLedgerEntry(NewLedgerParams{
+			Gcid:                 in.Gcid,
+			Direction:            direction,
+			Units:                in.Units,
+			Reason:               in.Reason,
+			SourceSubscriptionID: in.SourceSubscriptionID,
+			SourceTopupID:        in.SourceTopupID,
+			SourceAllocationID:   in.SourceAllocationID,
+			IdempotencyKey:       in.IdempotencyKey,
+			BalanceAfterUnits:    balAfter,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := q.store.AppendLedger(ctx, e); err != nil {
+			return nil, err
+		}
+		return &CreditResult{Entry: e, BalanceAfterUnits: balAfter}, nil
 	}
 
-	if err := q.store.SaveMana(ctx, mana); err != nil {
-		return nil, err
-	}
-
-	// Compute balance_after for ledger entry.
-	allocs, _ := q.store.ListAllocations(ctx, in.Gcid)
-	subsidy := int64(0)
-	for _, a := range allocs {
-		subsidy += a.RemainingUnits
-	}
-	balAfter := subsidy + mana.BalanceUnits
-
-	e, err := NewLedgerEntry(NewLedgerParams{
+	// Every other source credits the PERSONAL balance: route it through the
+	// atomic primitive so the wallet write and the ledger insert commit
+	// together (or not at all).
+	res, err := q.store.CreditWallet(ctx, CreditWalletInput{
 		Gcid:                 in.Gcid,
-		Direction:            direction,
 		Units:                in.Units,
+		Direction:            direction,
 		Reason:               in.Reason,
+		IdempotencyKey:       in.IdempotencyKey,
 		SourceSubscriptionID: in.SourceSubscriptionID,
 		SourceTopupID:        in.SourceTopupID,
 		SourceAllocationID:   in.SourceAllocationID,
-		IdempotencyKey:       in.IdempotencyKey,
-		BalanceAfterUnits:    balAfter,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := q.store.AppendLedger(ctx, e); err != nil {
-		return nil, err
-	}
-	return &CreditResult{Entry: e, BalanceAfterUnits: balAfter}, nil
+	return &CreditResult{
+		Entry:             res.Entry,
+		BalanceAfterUnits: res.BalanceAfterUnits,
+		Replayed:          res.Replayed,
+	}, nil
 }
 
 // Breakdown returns balance + per-source slices in deterministic FIFO order
@@ -787,6 +872,116 @@ func (s *InMemoryStore) UpdateAllocationRemaining(_ context.Context, gcid, alloc
 		}
 	}
 	return fmt.Errorf("user_mana: allocation %q not found for gcid %q", allocationID, gcid)
+}
+
+// CreditWallet applies an atomic credit: the wallet mutation and the ledger
+// append happen under ONE mutex, so the in-memory store has the same
+// atomicity guarantee the pg adapter gets from its single transaction.
+func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*CreditWalletResult, error) {
+	if err := ValidateCreditWalletInput(in); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing := s.findLedgerLocked(in.Gcid, in.IdempotencyKey); len(existing) > 0 {
+		m, _ := s.mana[in.Gcid]
+		bal, _ := s.balanceIncludingSubsidyLocked(m, in.Gcid)
+		return &CreditWalletResult{Wallet: cloneMana(m), Entry: existing[0],
+			BalanceAfterUnits: bal, Replayed: true}, nil
+	}
+
+	m, ok := s.mana[in.Gcid]
+	if !ok {
+		m = NewUserMana(in.Gcid)
+	}
+	if err := m.Credit(in.Units); err != nil {
+		return nil, err
+	}
+	s.mana[in.Gcid] = m
+
+	e, err := NewLedgerEntry(NewLedgerParams{
+		Gcid:                 in.Gcid,
+		Direction:            in.Direction,
+		Units:                in.Units,
+		Reason:               in.Reason,
+		SourceSubscriptionID: in.SourceSubscriptionID,
+		SourceActionID:       in.SourceActionID,
+		SourceAllocationID:   in.SourceAllocationID,
+		SourceTopupID:        in.SourceTopupID,
+		IdempotencyKey:       in.IdempotencyKey,
+		RequestID:            in.RequestID,
+		BalanceAfterUnits:    s.balanceAfterLocked(m, in.Gcid),
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.ledger = append(s.ledger, e)
+	return &CreditWalletResult{Wallet: cloneMana(m), Entry: e,
+		BalanceAfterUnits: e.BalanceAfterUnits}, nil
+}
+
+// SumLedgerUnitsByReason totals `reason` across every gcid. The in-memory
+// store has no RLS, so this is a plain scan.
+func (s *InMemoryStore) SumLedgerUnitsByReason(_ context.Context, reason Reason) (int64, error) {
+	if !reason.Valid() {
+		return 0, fmt.Errorf("user_mana: invalid reason %q", reason)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out int64
+	for _, e := range s.ledger {
+		if e.Reason == reason {
+			out += e.Units
+		}
+	}
+	return out, nil
+}
+
+// findLedgerLocked returns the ledger rows matching (gcid, key). Caller holds mu.
+func (s *InMemoryStore) findLedgerLocked(gcid, key string) []*LedgerEntry {
+	if key == "" {
+		return nil
+	}
+	out := make([]*LedgerEntry, 0)
+	for _, e := range s.ledger {
+		if e.Gcid == gcid && e.IdempotencyKey == key {
+			clone := *e
+			out = append(out, &clone)
+		}
+	}
+	return out
+}
+
+// balanceAfterLocked computes subsidy total + personal balance for the ledger
+// row's balance_after_units. Caller holds mu.
+func (s *InMemoryStore) balanceAfterLocked(m *UserMana, gcid string) int64 {
+	bal := int64(0)
+	for _, a := range s.allocations[gcid] {
+		bal += a.RemainingUnits
+	}
+	if m != nil {
+		bal += m.BalanceUnits
+	}
+	return bal
+}
+
+// balanceIncludingSubsidyLocked is balanceAfterLocked with a nil-safe wallet.
+func (s *InMemoryStore) balanceIncludingSubsidyLocked(m *UserMana, gcid string) (int64, error) {
+	return s.balanceAfterLocked(m, gcid), nil
+}
+
+// cloneMana deep-copies a wallet snapshot (nil-safe). Caller holds mu.
+func cloneMana(m *UserMana) *UserMana {
+	if m == nil {
+		return nil
+	}
+	clone := *m
+	if m.LastCreditedAt != nil {
+		t := *m.LastCreditedAt
+		clone.LastCreditedAt = &t
+	}
+	return &clone
 }
 
 // AddAllocation is a test convenience that bypasses SaveAllocation's upsert.

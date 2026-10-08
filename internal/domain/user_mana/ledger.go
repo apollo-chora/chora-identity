@@ -42,13 +42,17 @@ const (
 	ReasonTenantSubsidy     Reason = "tenant_subsidy"
 	ReasonTopup             Reason = "topup"
 	ReasonRollover          Reason = "rollover"
+	// ReasonDemoGrant is a FREE server-issued demo mint. Distinct from
+	// ReasonTopup, which means a PAID purchase: collapsing the two would
+	// mislabel free demo mana as revenue-bearing in every downstream report.
+	ReasonDemoGrant Reason = "demo_grant"
 )
 
-// Valid reports whether the reason is one of the known 8.
+// Valid reports whether the reason is one of the known 9.
 func (r Reason) Valid() bool {
 	switch r {
 	case ReasonSubscriptionGrant, ReasonFamiliarAction, ReasonRefund, ReasonAccountClosure,
-		ReasonPromo, ReasonTenantSubsidy, ReasonTopup, ReasonRollover:
+		ReasonPromo, ReasonTenantSubsidy, ReasonTopup, ReasonRollover, ReasonDemoGrant:
 		return true
 	}
 	return false

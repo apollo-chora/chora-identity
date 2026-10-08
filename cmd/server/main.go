@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -664,6 +665,42 @@ func main() {
 	economyHandler.RegisterRoutes(economyMux)
 	passkeyHandler.RegisterRoutes(economyMux)
 	kycHandler.RegisterRoutes(economyMux)
+
+	// -----------------------------------------------------------------------
+	// Demo mana grant — POST /api/v1/me/mana/demo-grant
+	//
+	// Default OFF. Available ONLY when BOTH CHORA_DEMO_MANA_TOPUP_ENABLED=true
+	// AND CHORA_DEMO_MODE=true are set, and NEVER when CHORA_ENV is
+	// prod/production — CHORA_ENV alone can never turn it on. The grant amount
+	// is fixed server-side (never from the request body) and the GCID comes
+	// only from the validated session context.
+	// -----------------------------------------------------------------------
+	demoManaCfg := httpadapter.DemoManaConfig{
+		GrantUnits:       1_000_000,
+		MaxPerGcid:       10,
+		TotalBudgetUnits: 1_000_000_000,
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_UNITS")), 10, 64); err == nil && v > 0 {
+		demoManaCfg.GrantUnits = v
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_MAX_PER_GCID")), 10, 64); err == nil && v > 0 {
+		demoManaCfg.MaxPerGcid = v
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_TOTAL_BUDGET")), 10, 64); err == nil && v > 0 {
+		demoManaCfg.TotalBudgetUnits = v
+	}
+	demoModeOn := strings.EqualFold(strings.TrimSpace(os.Getenv("CHORA_DEMO_MODE")), "true")
+	demoTopupOn := strings.EqualFold(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_TOPUP_ENABLED")), "true")
+	demoInProd := strings.EqualFold(choraEnv, "prod") || strings.EqualFold(choraEnv, "production")
+	demoManaCfg.Enabled = demoModeOn && demoTopupOn && !demoInProd
+	if demoManaCfg.Enabled {
+		log.Printf("identity: demo mana grant ENABLED (units=%d max_per_gcid=%d total_budget=%d)",
+			demoManaCfg.GrantUnits, demoManaCfg.MaxPerGcid, demoManaCfg.TotalBudgetUnits)
+	} else {
+		log.Printf("identity: demo mana grant disabled (CHORA_DEMO_MODE=%t CHORA_DEMO_MANA_TOPUP_ENABLED=%t CHORA_ENV=%s)",
+			demoModeOn, demoTopupOn, choraEnv)
+	}
+	httpadapter.NewDemoManaHandler(routerUsers, manaStore, demoManaCfg).RegisterRoutes(economyMux)
 
 	// SP2.9 — GCID-scoped UI preferences (A+ dashboard-as-hub layout) on the
 	// User profile aggregate (users.ui_preferences JSONB, migration 0034).
