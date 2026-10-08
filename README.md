@@ -45,6 +45,8 @@ go run ./cmd/seed
 
 The seed job is idempotent. It upserts the tenant, user, local Argon2id credential, and active admin membership in one transaction.
 
+Two more users can be seeded alongside the admin: set `CHORA_SEED_INSTRUCTOR_USERNAME` (role `instructor`) and/or `CHORA_SEED_STUDENT_USERNAME` — the matching `_EMAIL` and `_PASSWORD` variables then become required. The student account is stored with membership_role `learner`; the stored role vocabulary has no `student` value. PLATFORM_OPERATOR is intentionally not seedable here (ADR-165: cross-tenant role with no membership row).
+
 ## Usage
 
 ### Health and readiness

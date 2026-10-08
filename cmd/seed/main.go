@@ -1,16 +1,30 @@
-// Command seed is the idempotent local-admin provisioning job for
+// Command seed is the idempotent local-user provisioning job for
 // chora-identity.
 //
 // It reads its inputs from the environment and, in ONE transaction, upserts a
-// tenant, a user, the user's Argon2id credential, and an ACTIVE admin
-// membership. Every write is keyed on a STABLE identifier (deterministic GCID,
-// fixed tenant UUID, normalised username, (gcid,tenant_id,role)), so re-running
-// the job is a no-op.
+// tenant plus, for each configured seed user, a user row, the user's Argon2id
+// credential, and an ACTIVE membership. Every write is keyed on a STABLE
+// identifier (deterministic GCID, fixed tenant UUID, normalised username,
+// (gcid,tenant_id,role)), so re-running the job is a no-op.
+//
+// Seed users:
+//
+//	admin      — always seeded (role `admin`).
+//	instructor — seeded when CHORA_SEED_INSTRUCTOR_USERNAME is set (role
+//	             `instructor`).
+//	student    — seeded when CHORA_SEED_STUDENT_USERNAME is set. There is no
+//	             `student` value in the stored membership_role vocabulary
+//	             ({learner,instructor,admin,auditor,author,owner} — see
+//	             internal/domain/identity/membership.go); the student account is
+//	             seeded with role `learner`.
+//
+// PLATFORM_OPERATOR is deliberately NOT seedable here: it is the sole
+// cross-tenant role (ADR-165) with no membership_role ENUM value and no
+// tenant_memberships row — see migrations/0014_platform_operator_role.up.sql.
 //
 // Argon2id uses a random salt, so the stored hash is NOT rewritten on every
-// run: it is only replaced when it no longer verifies against
-// CHORA_SEED_ADMIN_PASSWORD. The cleartext password is never logged or
-// committed.
+// run: it is only replaced when it no longer verifies against the configured
+// password. The cleartext password is never logged or committed.
 //
 // Environment:
 //
@@ -20,6 +34,12 @@
 //	CHORA_SEED_ADMIN_USERNAME — admin username (required)
 //	CHORA_SEED_ADMIN_EMAIL    — admin email (required)
 //	CHORA_SEED_ADMIN_PASSWORD — admin password (required)
+//	CHORA_SEED_INSTRUCTOR_USERNAME  — instructor username (optional)
+//	CHORA_SEED_INSTRUCTOR_EMAIL     — instructor email (required when username set)
+//	CHORA_SEED_INSTRUCTOR_PASSWORD  — instructor password (required when username set)
+//	CHORA_SEED_STUDENT_USERNAME     — student username (optional)
+//	CHORA_SEED_STUDENT_EMAIL        — student email (required when username set)
+//	CHORA_SEED_STUDENT_PASSWORD     — student password (required when username set)
 //
 // Usage:
 //
@@ -56,6 +76,14 @@ type config struct {
 	Username   string
 	Email      string
 	Password   string
+
+	InstructorUsername string
+	InstructorEmail    string
+	InstructorPassword string
+
+	StudentUsername string
+	StudentEmail    string
+	StudentPassword string
 }
 
 func loadConfig() (config, error) {
@@ -66,16 +94,34 @@ func loadConfig() (config, error) {
 		Username:   strings.TrimSpace(os.Getenv("CHORA_SEED_ADMIN_USERNAME")),
 		Email:      strings.TrimSpace(os.Getenv("CHORA_SEED_ADMIN_EMAIL")),
 		Password:   os.Getenv("CHORA_SEED_ADMIN_PASSWORD"),
+
+		InstructorUsername: strings.TrimSpace(os.Getenv("CHORA_SEED_INSTRUCTOR_USERNAME")),
+		InstructorEmail:    strings.TrimSpace(os.Getenv("CHORA_SEED_INSTRUCTOR_EMAIL")),
+		InstructorPassword: os.Getenv("CHORA_SEED_INSTRUCTOR_PASSWORD"),
+
+		StudentUsername: strings.TrimSpace(os.Getenv("CHORA_SEED_STUDENT_USERNAME")),
+		StudentEmail:    strings.TrimSpace(os.Getenv("CHORA_SEED_STUDENT_EMAIL")),
+		StudentPassword: os.Getenv("CHORA_SEED_STUDENT_PASSWORD"),
 	}
-	var missing []string
-	for k, v := range map[string]string{
+	required := map[string]string{
 		"CHORA_DB_DSN":              c.DSN,
 		"CHORA_SEED_TENANT_ID":      c.TenantID,
 		"CHORA_SEED_TENANT_SLUG":    c.TenantSlug,
 		"CHORA_SEED_ADMIN_USERNAME": c.Username,
 		"CHORA_SEED_ADMIN_EMAIL":    c.Email,
 		"CHORA_SEED_ADMIN_PASSWORD": c.Password,
-	} {
+	}
+	// Optional seed users: a set username pulls in its email + password.
+	if c.InstructorUsername != "" {
+		required["CHORA_SEED_INSTRUCTOR_EMAIL"] = c.InstructorEmail
+		required["CHORA_SEED_INSTRUCTOR_PASSWORD"] = c.InstructorPassword
+	}
+	if c.StudentUsername != "" {
+		required["CHORA_SEED_STUDENT_EMAIL"] = c.StudentEmail
+		required["CHORA_SEED_STUDENT_PASSWORD"] = c.StudentPassword
+	}
+	var missing []string
+	for k, v := range required {
 		if v == "" {
 			missing = append(missing, k)
 		}
@@ -92,17 +138,81 @@ func loadConfig() (config, error) {
 	if len(c.Password) > authn.MaxPasswordBytes {
 		return c, fmt.Errorf("CHORA_SEED_ADMIN_PASSWORD exceeds %d bytes", authn.MaxPasswordBytes)
 	}
+	if c.InstructorUsername != "" {
+		if !identity.LooseValidEmail(c.InstructorEmail) {
+			return c, fmt.Errorf("CHORA_SEED_INSTRUCTOR_EMAIL is not a valid email")
+		}
+		if len(c.InstructorPassword) > authn.MaxPasswordBytes {
+			return c, fmt.Errorf("CHORA_SEED_INSTRUCTOR_PASSWORD exceeds %d bytes", authn.MaxPasswordBytes)
+		}
+	}
+	if c.StudentUsername != "" {
+		if !identity.LooseValidEmail(c.StudentEmail) {
+			return c, fmt.Errorf("CHORA_SEED_STUDENT_EMAIL is not a valid email")
+		}
+		if len(c.StudentPassword) > authn.MaxPasswordBytes {
+			return c, fmt.Errorf("CHORA_SEED_STUDENT_PASSWORD exceeds %d bytes", authn.MaxPasswordBytes)
+		}
+	}
 	return c, nil
 }
 
-// adminGcid derives the deterministic GCID for the seeded admin.
-func adminGcid(usernameNorm string) string {
+// seedGcid derives the deterministic GCID for a seeded user, keyed on the
+// normalised username. The "chora-identity-local-admin" name string is kept
+// verbatim so the seeded admin's GCID is stable across this refactor.
+func seedGcid(usernameNorm string) string {
 	return uuid.NewSHA1(seedNamespace, []byte("chora-identity-local-admin:"+usernameNorm)).String()
 }
 
 // membershipID derives the deterministic membership UUID.
 func membershipID(gcid, tenantID, role string) string {
 	return uuid.NewSHA1(seedNamespace, []byte("membership:"+gcid+":"+tenantID+":"+role)).String()
+}
+
+// seedUser is one seeded account: user row + Argon2id credential + membership.
+type seedUser struct {
+	Username string
+	Email    string
+	Password string
+	Role     identity.Role
+}
+
+// seedUsers builds the ordered seed list: the admin (always) plus the
+// instructor and student when their usernames are configured. The student
+// account carries role `learner` — the stored membership_role vocabulary has
+// no `student` value (see internal/domain/identity/membership.go).
+func seedUsers(cfg config) ([]seedUser, error) {
+	users := []seedUser{{
+		Username: cfg.Username,
+		Email:    cfg.Email,
+		Password: cfg.Password,
+		Role:     identity.RoleAdmin,
+	}}
+	if cfg.InstructorUsername != "" {
+		users = append(users, seedUser{
+			Username: cfg.InstructorUsername,
+			Email:    cfg.InstructorEmail,
+			Password: cfg.InstructorPassword,
+			Role:     identity.RoleInstructor,
+		})
+	}
+	if cfg.StudentUsername != "" {
+		users = append(users, seedUser{
+			Username: cfg.StudentUsername,
+			Email:    cfg.StudentEmail,
+			Password: cfg.StudentPassword,
+			Role:     identity.RoleLearner,
+		})
+	}
+	seen := map[string]bool{}
+	for _, u := range users {
+		norm := authn.NormalizeUsername(u.Username)
+		if seen[norm] {
+			return nil, fmt.Errorf("duplicate seed username: %q", u.Username)
+		}
+		seen[norm] = true
+	}
+	return users, nil
 }
 
 func main() {
@@ -128,15 +238,13 @@ func main() {
 	if err := run(runCtx, pool, cfg); err != nil {
 		log.Fatalf("seed: %v", err)
 	}
-	// Never log the password.
-	log.Printf("seed: ok — tenant=%s slug=%s username=%s gcid=%s",
-		cfg.TenantID, cfg.TenantSlug, authn.NormalizeUsername(cfg.Username), adminGcid(authn.NormalizeUsername(cfg.Username)))
 }
 
 func run(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
-	usernameNorm := authn.NormalizeUsername(cfg.Username)
-	gcid := adminGcid(usernameNorm)
-	const role = string(identity.RoleAdmin)
+	users, err := seedUsers(cfg)
+	if err != nil {
+		return err
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -170,7 +278,35 @@ func run(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 		return fmt.Errorf("upsert tenant: %w", err)
 	}
 
-	// 2. User (deterministic GCID; local password provider).
+	// 2. One user + credential + active membership per seed user.
+	for _, u := range users {
+		if err := upsertUser(ctx, tx, cfg.TenantID, u); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	committed = true
+
+	// Never log the passwords.
+	labels := make([]string, 0, len(users))
+	for _, u := range users {
+		labels = append(labels, u.Username+"("+string(u.Role)+")")
+	}
+	log.Printf("seed: ok — tenant=%s slug=%s users=%s",
+		cfg.TenantID, cfg.TenantSlug, strings.Join(labels, ","))
+	return nil
+}
+
+// upsertUser writes one seed user (user row, Argon2id credential, active
+// membership) inside the seed transaction.
+func upsertUser(ctx context.Context, tx pgx.Tx, tenantID string, u seedUser) error {
+	usernameNorm := authn.NormalizeUsername(u.Username)
+	gcid := seedGcid(usernameNorm)
+
+	// User (deterministic GCID; local password provider).
 	if _, err := tx.Exec(ctx, `
         INSERT INTO users (gcid, email, display_name, identity_provider, federated_subject, status)
         VALUES ($1::uuid, $2, $3, 'password'::identity_provider, $4, 'active')
@@ -182,13 +318,13 @@ func run(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
             status = 'active',
             deleted_at = NULL,
             updated_at = now()`,
-		gcid, cfg.Email, cfg.Username, usernameNorm,
+		gcid, u.Email, u.Username, usernameNorm,
 	); err != nil {
 		return fmt.Errorf("upsert user: %w", err)
 	}
 
-	// 3. Credential — only re-hash when the stored hash no longer verifies.
-	hash, err := resolveHash(ctx, tx, gcid, usernameNorm, cfg.Password)
+	// Credential — only re-hash when the stored hash no longer verifies.
+	hash, err := resolveHash(ctx, tx, gcid, usernameNorm, u.Password)
 	if err != nil {
 		return err
 	}
@@ -200,27 +336,22 @@ func run(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
             username_norm = EXCLUDED.username_norm,
             password_hash = EXCLUDED.password_hash,
             updated_at = now()`,
-		gcid, cfg.Username, usernameNorm, hash,
+		gcid, u.Username, usernameNorm, hash,
 	); err != nil {
 		return fmt.Errorf("upsert credential: %w", err)
 	}
 
-	// 4. Active admin membership.
+	// Active membership.
 	if _, err := tx.Exec(ctx, `
         INSERT INTO tenant_memberships (membership_id, gcid, tenant_id, role, status)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, 'admin'::membership_role, 'active'::membership_status)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::membership_role, 'active'::membership_status)
         ON CONFLICT (gcid, tenant_id, role) DO UPDATE
         SET status = 'active',
             updated_at = now()`,
-		membershipID(gcid, cfg.TenantID, role), gcid, cfg.TenantID,
+		membershipID(gcid, tenantID, string(u.Role)), gcid, tenantID, string(u.Role),
 	); err != nil {
 		return fmt.Errorf("upsert membership: %w", err)
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	committed = true
 	return nil
 }
 
