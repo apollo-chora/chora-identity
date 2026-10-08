@@ -23,7 +23,8 @@ const (
 )
 
 // newDemoServer wires a DemoManaHandler over the in-memory mana store and
-// returns the mux plus the store so a test can inspect balances directly.
+// returns the mux plus the store so a test can inspect balances directly. Each
+// GCID gets its own email.
 func newDemoServer(t *testing.T, cfg httpadapter.DemoManaConfig, gcids ...string) (http.Handler, *mana.InMemoryStore) {
 	t.Helper()
 	users := inmem.NewUserRepository()
@@ -39,18 +40,59 @@ func newDemoServer(t *testing.T, cfg httpadapter.DemoManaConfig, gcids ...string
 			t.Fatalf("Save(%s): %v", g, err)
 		}
 	}
+	return demoServer(t, users, cfg)
+}
+
+// newDemoServerSameEmail wires several GCIDs that share ONE email address. The
+// demo allowlist is keyed on the GCID, never on the email, so an account that
+// merely shares the allowed account's email must still be refused.
+func newDemoServerSameEmail(t *testing.T, cfg httpadapter.DemoManaConfig, email string, gcids ...string) (http.Handler, *mana.InMemoryStore) {
+	t.Helper()
+	users := inmem.NewUserRepository()
+	for _, g := range gcids {
+		u, err := identity.NewUser(identity.NewUserParams{
+			Email: email, IdentityProvider: identity.ProviderOIDC, FederatedSubject: g,
+		})
+		if err != nil {
+			t.Fatalf("NewUser(%s): %v", g, err)
+		}
+		u.Gcid = g
+		if err := users.Save(context.Background(), u); err != nil {
+			t.Fatalf("Save(%s): %v", g, err)
+		}
+	}
+	return demoServer(t, users, cfg)
+}
+
+func demoServer(t *testing.T, users identity.UserRepository, cfg httpadapter.DemoManaConfig) (http.Handler, *mana.InMemoryStore) {
+	t.Helper()
 	store := repo.NewInMemManaStore()
 	mux := http.NewServeMux()
 	httpadapter.NewDemoManaHandler(users, store, cfg).RegisterRoutes(mux)
 	return mux, store
 }
 
+// demoAllowlist builds the immutable canonical set the composition root passes
+// into DemoManaConfig from CHORA_DEMO_MANA_ALLOWED_GCIDS. The inputs are test
+// constants, so a malformed one is a bug in the spec, not a scenario.
+func demoAllowlist(gcids ...string) map[string]struct{} {
+	set, malformed := httpadapter.ParseDemoManaAllowedGcids(strings.Join(gcids, ","))
+	if len(malformed) > 0 {
+		panic("test gcids must be valid UUIDs: " + strings.Join(malformed, ","))
+	}
+	return set
+}
+
+// demoEnabled returns an enabled demo config whose allowlist covers both test
+// accounts. The endpoint grants ONLY to allowlisted GCIDs, so every
+// happy-path spec must carry one.
 func demoEnabled(units int64) httpadapter.DemoManaConfig {
 	return httpadapter.DemoManaConfig{
 		Enabled:          true,
 		GrantUnits:       units,
 		MaxPerGcid:       10,
 		TotalBudgetUnits: 1_000_000_000,
+		AllowedGcids:     demoAllowlist(demoGcidA, demoGcidB),
 	}
 }
 
@@ -376,6 +418,215 @@ func TestDemoGrant_ReplayAfterCapReached_StillReturns200(t *testing.T) {
 	}
 	if got := mustBalance(t, store, demoGcidA); got != 1_000_000 {
 		t.Errorf("balance = %d, want 1000000", got)
+	}
+}
+
+// --- allowlist gate (CHORA_DEMO_MANA_ALLOWED_GCIDS) ---------------------------
+
+func TestDemoGrant_AllowlistedGcid_Grants(t *testing.T) {
+	cfg := demoEnabled(1_000_000)
+	cfg.AllowedGcids = demoAllowlist(demoGcidA)
+	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
+
+	rec := doDemo(t, h, demoPost(demoGcidA, "k-allowed", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidA); got != 1_000_000 {
+		t.Errorf("balance = %d, want 1000000", got)
+	}
+}
+
+func TestDemoGrant_NonAllowlistedGcid_Returns403(t *testing.T) {
+	cfg := demoEnabled(1_000_000)
+	cfg.AllowedGcids = demoAllowlist(demoGcidA)
+	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
+
+	rec := doDemo(t, h, demoPost(demoGcidB, "k-denied", ""))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	body := demoBody(t, rec)
+	if body["code"] != "DEMO_ACCOUNT_NOT_ALLOWED" {
+		t.Errorf("code = %v, want DEMO_ACCOUNT_NOT_ALLOWED", body["code"])
+	}
+	if body["message"] != "demo mana grants are restricted" {
+		t.Errorf("message = %v, want the restricted-grants message", body["message"])
+	}
+	if got := mustBalance(t, store, demoGcidB); got != 0 {
+		t.Errorf("balance = %d, want 0 — a non-allowlisted account must not be credited", got)
+	}
+	entries, err := store.ListLedger(context.Background(), mana.LedgerFilter{Gcid: demoGcidB})
+	if err != nil {
+		t.Fatalf("ListLedger: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("ledger rows = %d, want 0 — the denial must not touch the ledger", len(entries))
+	}
+	// The allowed account is untouched too: the caller cannot credit anyone
+	// else by being refused.
+	if got := mustBalance(t, store, demoGcidA); got != 0 {
+		t.Errorf("A balance = %d, want 0", got)
+	}
+
+	// Identity is settled before the request shape: a denied account gets 403
+	// even when it also omits the required Idempotency-Key.
+	rec = doDemo(t, h, demoPost(demoGcidB, "", ""))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("no idempotency key: status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidB); got != 0 {
+		t.Errorf("balance = %d, want 0", got)
+	}
+}
+
+func TestDemoGrant_EmptyAllowlist_DeniesEveryone(t *testing.T) {
+	// FAIL CLOSED. The composition root refuses to boot an enabled endpoint
+	// without an allowlist (see cmd/server/demo_mana_config_test.go); if one
+	// ever reached the handler it must allow nobody.
+	for name, set := range map[string]map[string]struct{}{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := demoEnabled(1_000_000)
+			cfg.AllowedGcids = set
+			h, store := newDemoServer(t, cfg, demoGcidA)
+
+			rec := doDemo(t, h, demoPost(demoGcidA, "k-empty", ""))
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "DEMO_ACCOUNT_NOT_ALLOWED") {
+				t.Errorf("body = %s, want DEMO_ACCOUNT_NOT_ALLOWED", rec.Body.String())
+			}
+			if got := mustBalance(t, store, demoGcidA); got != 0 {
+				t.Errorf("balance = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestDemoGrant_DisabledWithAllowlist_NoGrant(t *testing.T) {
+	// An allowlisted GCID still gets NOTHING while the endpoint is off.
+	cfg := demoEnabled(1_000_000)
+	cfg.Enabled = false
+	cfg.AllowedGcids = demoAllowlist(demoGcidA)
+	h, store := newDemoServer(t, cfg, demoGcidA)
+
+	rec := doDemo(t, h, demoPost(demoGcidA, "k-off", ""))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "DEMO_UNAVAILABLE") {
+		t.Errorf("body = %s, want DEMO_UNAVAILABLE", rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidA); got != 0 {
+		t.Errorf("balance = %d, want 0 — a disabled demo must not credit an allowlisted account", got)
+	}
+}
+
+func TestDemoGrant_SameEmailDifferentGcid_Denied(t *testing.T) {
+	// The allowlist is keyed on the GCID, never on the email. An account that
+	// merely shares the allowed account's email address is refused.
+	const sharedEmail = "demo@chora.dev"
+	cfg := demoEnabled(1_000_000)
+	cfg.AllowedGcids = demoAllowlist(demoGcidA)
+	h, store := newDemoServerSameEmail(t, cfg, sharedEmail, demoGcidA, demoGcidB)
+
+	// Sanity: both accounts really do share the email.
+	rec := doDemo(t, h, demoPost(demoGcidA, "k-shared-a", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("allowlisted account: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	rec = doDemo(t, h, demoPost(demoGcidB, "k-shared-b", ""))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("same-email other GCID: status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "DEMO_ACCOUNT_NOT_ALLOWED") {
+		t.Errorf("body = %s, want DEMO_ACCOUNT_NOT_ALLOWED", rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidB); got != 0 {
+		t.Errorf("B balance = %d, want 0 — a shared email grants nothing", got)
+	}
+}
+
+func TestDemoGrant_SpoofedGcidInBodyAndHeader_Ignored(t *testing.T) {
+	// The allowlist decision uses the AUTHENTICATED GCID only. B is refused
+	// even though the request names the allowlisted A in the body, the query
+	// string and headers.
+	cfg := demoEnabled(1_000_000)
+	cfg.AllowedGcids = demoAllowlist(demoGcidA)
+	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
+
+	req := demoPost(demoGcidB, "k-spoof", `{"gcid":"`+demoGcidA+`","units":999999999}`)
+	req.URL.RawQuery = "gcid=" + demoGcidA
+	// Neither header is read by the auth path (the trusted mesh header is
+	// `chora-gcid`, stamped by the gateway) — they must not reach the check.
+	req.Header.Set("X-Gcid", demoGcidA)
+	req.Header.Set("X-Chora-GCID", demoGcidA)
+
+	rec := doDemo(t, h, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "DEMO_ACCOUNT_NOT_ALLOWED") {
+		t.Errorf("body = %s, want DEMO_ACCOUNT_NOT_ALLOWED", rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidB); got != 0 {
+		t.Errorf("B balance = %d, want 0", got)
+	}
+	if got := mustBalance(t, store, demoGcidA); got != 0 {
+		t.Errorf("A balance = %d, want 0 — the spoofed GCID must not be credited", got)
+	}
+}
+
+func TestDemoGrant_AllowlistCanonicalisesGcid(t *testing.T) {
+	// The set holds canonical UUID strings, so an uppercase or unhyphenated
+	// allowlist entry still matches the canonical GCID from the context.
+	const upper = "01970000-0000-7000-8000-00000000DA01"
+	for _, entry := range []string{upper, strings.ReplaceAll(demoGcidA, "-", "")} {
+		set, malformed := httpadapter.ParseDemoManaAllowedGcids(" " + entry + " ")
+		if len(malformed) != 0 {
+			t.Fatalf("ParseDemoManaAllowedGcids(%q) malformed = %v, want none", entry, malformed)
+		}
+		if _, ok := set[demoGcidA]; !ok {
+			t.Errorf("set from %q = %v, want the canonical key %s", entry, set, demoGcidA)
+		}
+		cfg := demoEnabled(1_000_000)
+		cfg.AllowedGcids = set
+		h, store := newDemoServer(t, cfg, demoGcidA)
+		rec := doDemo(t, h, demoPost(demoGcidA, "k-canon", ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("entry %q: status = %d, want 200 (body=%s)", entry, rec.Code, rec.Body.String())
+		}
+		if got := mustBalance(t, store, demoGcidA); got != 1_000_000 {
+			t.Errorf("balance = %d, want 1000000", got)
+		}
+	}
+}
+
+func TestDemoManaConfig_AllowsGcid_FailsClosed(t *testing.T) {
+	cfg := httpadapter.DemoManaConfig{AllowedGcids: demoAllowlist(demoGcidA)}
+	cases := map[string]struct {
+		gcid string
+		want bool
+	}{
+		"allowlisted":           {demoGcidA, true},
+		"allowlisted uppercase": {strings.ToUpper(demoGcidA), true},
+		"not allowlisted":       {demoGcidB, false},
+		"empty gcid":            {"", false},
+		"not a uuid":            {"demo-gcid", false},
+		"jwt-shaped bearer":     {"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig", false},
+	}
+	for name, tc := range cases {
+		if got := cfg.AllowsGcid(tc.gcid); got != tc.want {
+			t.Errorf("%s: AllowsGcid(%q) = %t, want %t", name, tc.gcid, got, tc.want)
+		}
+	}
+	if (httpadapter.DemoManaConfig{}).AllowsGcid(demoGcidA) {
+		t.Error("zero config allows a GCID — the allowlist must fail closed")
 	}
 }
 

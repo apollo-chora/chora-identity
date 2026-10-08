@@ -11,6 +11,13 @@
 // refuses outright when CHORA_ENV is prod/production. CHORA_ENV alone is never
 // sufficient to turn it on.
 //
+// ACCOUNT ALLOWLIST. Even when enabled, the endpoint grants ONLY to GCIDs
+// listed in CHORA_DEMO_MANA_ALLOWED_GCIDS — the designated demo accounts.
+// Anyone else gets 403 DEMO_ACCOUNT_NOT_ALLOWED. The allowlist is parsed and
+// validated at startup (an enabled endpoint without a usable allowlist refuses
+// to boot) and checked in the identity service itself, not at the gateway or in
+// the frontend.
+//
 // The grant amount is FIXED server-side (configurable, never from the request
 // body) and the GCID comes ONLY from the validated server-side session context
 // — never from a request parameter.
@@ -28,6 +35,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/apollo-chora/chora-identity/internal/domain/identity"
 	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
@@ -54,6 +63,64 @@ type DemoManaConfig struct {
 	// TotalBudgetUnits is the platform-wide budget for INTERACTIVE demo grants.
 	// 0 means uncapped. The seed grant does not consume it.
 	TotalBudgetUnits int64
+
+	// AllowedGcids is the immutable allowlist of canonical (lowercase,
+	// hyphenated) UUID strings permitted to claim a demo grant — the designated
+	// demo accounts. It is REQUIRED whenever Enabled is true: the composition
+	// root refuses to start an enabled endpoint without one. FAIL CLOSED — an
+	// empty set allows nobody, so a missing allowlist can never open the
+	// endpoint to every authenticated account.
+	AllowedGcids map[string]struct{}
+}
+
+// ParseDemoManaAllowedGcids parses the comma-separated
+// CHORA_DEMO_MANA_ALLOWED_GCIDS value into an immutable set of canonical UUID
+// strings. It returns the set plus every entry it could not parse, so the
+// composition root can refuse to start on a malformed allowlist instead of
+// silently dropping an account the operator meant to allow.
+func ParseDemoManaAllowedGcids(raw string) (map[string]struct{}, []string) {
+	allowed := make(map[string]struct{})
+	var malformed []string
+	for _, part := range strings.Split(raw, ",") {
+		entry := strings.TrimSpace(part)
+		if entry == "" {
+			continue
+		}
+		canonical, err := canonicalGcid(entry)
+		if err != nil {
+			malformed = append(malformed, entry)
+			continue
+		}
+		allowed[canonical] = struct{}{}
+	}
+	return allowed, malformed
+}
+
+// canonicalGcid returns the canonical (lowercase, hyphenated) form of a GCID.
+func canonicalGcid(gcid string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(gcid))
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+// AllowsGcid reports whether the authenticated GCID may claim a demo grant.
+//
+// FAIL CLOSED: an empty allowlist, an empty GCID or an unparseable GCID all
+// deny. The caller must pass the GCID from the validated server-side session
+// context — never one taken from the request body, query or an unrelated
+// header, which are attacker-controlled.
+func (c DemoManaConfig) AllowsGcid(gcid string) bool {
+	if len(c.AllowedGcids) == 0 {
+		return false
+	}
+	canonical, err := canonicalGcid(gcid)
+	if err != nil {
+		return false
+	}
+	_, ok := c.AllowedGcids[canonical]
+	return ok
 }
 
 // DemoManaHandler exposes POST /api/v1/me/mana/demo-grant.
@@ -87,6 +154,23 @@ func (h *DemoManaHandler) demoGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
+	// GCID comes ONLY from the validated server-side session context. Nothing
+	// in the request body, query string or headers is consulted for identity:
+	// the authenticated caller wins.
+	gcid := gcidFromContext(ctx)
+
+	// ALLOWLIST GATE — the demo grant is restricted to designated demo
+	// accounts. Identity is settled FIRST: a caller who is not on the list is
+	// refused whatever the rest of the request looks like, and the decision is
+	// keyed on the authenticated GCID alone, so a caller can neither grant to
+	// an account they are not nor name an allowed account in the request.
+	if !h.cfg.AllowsGcid(gcid) {
+		writeError(w, http.StatusForbidden, "DEMO_ACCOUNT_NOT_ALLOWED",
+			"demo mana grants are restricted")
+		return
+	}
+
 	// The idempotency key is REQUIRED — the client must supply it so a retry
 	// cannot double-grant. Unlike purchaseSubscription, we never mint one.
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -95,10 +179,6 @@ func (h *DemoManaHandler) demoGrant(w http.ResponseWriter, r *http.Request) {
 			"Idempotency-Key header is required")
 		return
 	}
-
-	ctx := r.Context()
-	// GCID comes ONLY from the validated server-side session context.
-	gcid := gcidFromContext(ctx)
 
 	// ONE transactional call enforces both caps and applies the grant. The caps
 	// are checked AFTER the per-GCID and budget row locks are taken and BEFORE
@@ -164,4 +244,3 @@ func (h *DemoManaHandler) audit(gcid, idempotencyKey string, units int64, replay
 	log.Printf("identity: demo mana grant gcid=%s units=%d idempotency_key=%s replayed=%t balance_units=%d",
 		gcid, units, idempotencyKey, replayed, balance)
 }
-

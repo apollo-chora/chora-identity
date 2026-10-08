@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -674,28 +673,21 @@ func main() {
 	// prod/production — CHORA_ENV alone can never turn it on. The grant amount
 	// is fixed server-side (never from the request body) and the GCID comes
 	// only from the validated session context.
+	//
+	// Even when enabled, only GCIDs listed in CHORA_DEMO_MANA_ALLOWED_GCIDS may
+	// claim a grant. An enabled endpoint without a usable allowlist (or with a
+	// malformed entry) FAILS THE BOOT rather than serving free mana to whoever
+	// asks — see demoManaConfigFromEnv.
 	// -----------------------------------------------------------------------
-	demoManaCfg := httpadapter.DemoManaConfig{
-		GrantUnits:       1_000_000,
-		MaxPerGcid:       10,
-		TotalBudgetUnits: 1_000_000_000,
-	}
-	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_UNITS")), 10, 64); err == nil && v > 0 {
-		demoManaCfg.GrantUnits = v
-	}
-	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_MAX_PER_GCID")), 10, 64); err == nil && v > 0 {
-		demoManaCfg.MaxPerGcid = v
-	}
-	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_GRANT_TOTAL_BUDGET")), 10, 64); err == nil && v > 0 {
-		demoManaCfg.TotalBudgetUnits = v
-	}
 	demoModeOn := strings.EqualFold(strings.TrimSpace(os.Getenv("CHORA_DEMO_MODE")), "true")
 	demoTopupOn := strings.EqualFold(strings.TrimSpace(os.Getenv("CHORA_DEMO_MANA_TOPUP_ENABLED")), "true")
-	demoInProd := strings.EqualFold(choraEnv, "prod") || strings.EqualFold(choraEnv, "production")
-	demoManaCfg.Enabled = demoModeOn && demoTopupOn && !demoInProd
+	demoManaCfg, err := demoManaConfigFromEnv(choraEnv, demoModeOn, demoTopupOn)
+	if err != nil {
+		log.Fatalf("identity: demo mana grant config: %v", err)
+	}
 	if demoManaCfg.Enabled {
-		log.Printf("identity: demo mana grant ENABLED (units=%d max_per_gcid=%d total_budget=%d)",
-			demoManaCfg.GrantUnits, demoManaCfg.MaxPerGcid, demoManaCfg.TotalBudgetUnits)
+		log.Printf("identity: demo mana grant ENABLED (units=%d max_per_gcid=%d total_budget=%d allowed_gcids=%d)",
+			demoManaCfg.GrantUnits, demoManaCfg.MaxPerGcid, demoManaCfg.TotalBudgetUnits, len(demoManaCfg.AllowedGcids))
 	} else {
 		log.Printf("identity: demo mana grant disabled (CHORA_DEMO_MODE=%t CHORA_DEMO_MANA_TOPUP_ENABLED=%t CHORA_ENV=%s)",
 			demoModeOn, demoTopupOn, choraEnv)
