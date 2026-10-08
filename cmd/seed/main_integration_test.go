@@ -58,20 +58,45 @@ func seedDemoTx(t *testing.T, pool *pgxpool.Pool, tenantID string) (pgx.Tx, cont
 	return tx, ctx
 }
 
+// rowQuerier is the read surface shared by pgx.Tx and *pgxpool.Pool.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// scopedReadTx opens a transaction scoped to a GCID. Reads that happen AFTER
+// the seed transaction has ended need it twice over: a committed or rolled-back
+// pgx.Tx is closed, and user_mana / mana_ledger carry the user_isolation policy,
+// so an unscoped pooled read sees nothing.
+func scopedReadTx(t *testing.T, pool *pgxpool.Pool, ctx context.Context, gcid string) pgx.Tx {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin read tx: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(ctx) })
+	if _, err := tx.Exec(ctx, "SET LOCAL chora.user_gcid = '"+gcid+"'"); err != nil {
+		t.Fatalf("set user guc: %v", err)
+	}
+	return tx
+}
+
 func seedDemoTenant(t *testing.T, tx pgx.Tx, ctx context.Context, tenantID string) {
 	t.Helper()
+	// tenants.slug is UNIQUE and shared by every spec in this file, so it is
+	// derived from the (fresh) tenant id rather than a fixed literal.
+	slug := "demo-it-" + tenantID[:8]
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO tenants (id, slug, name, status)
-		VALUES ($1::uuid, 'demo-it', 'demo-it', 'active')
-		ON CONFLICT (id) DO NOTHING`, tenantID); err != nil {
+		VALUES ($1::uuid, $2, $2, 'active')
+		ON CONFLICT (id) DO NOTHING`, tenantID, slug); err != nil {
 		t.Fatalf("insert tenant: %v", err)
 	}
 }
 
-func walletBalance(t *testing.T, tx pgx.Tx, ctx context.Context, gcid string) int64 {
+func walletBalance(t *testing.T, q rowQuerier, ctx context.Context, gcid string) int64 {
 	t.Helper()
 	var bal int64
-	err := tx.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT COALESCE(balance_units, 0) FROM user_mana WHERE gcid = $1`, gcid).Scan(&bal)
 	if err == nil {
 		return bal
@@ -83,13 +108,24 @@ func walletBalance(t *testing.T, tx pgx.Tx, ctx context.Context, gcid string) in
 	return 0
 }
 
-func ledgerCount(t *testing.T, tx pgx.Tx, ctx context.Context, gcid string) int {
+func ledgerCount(t *testing.T, q rowQuerier, ctx context.Context, gcid string) int {
 	t.Helper()
 	var n int
-	if err := tx.QueryRow(ctx,
+	if err := q.QueryRow(ctx,
 		`SELECT count(*) FROM mana_ledger WHERE gcid = $1 AND idempotency_key = $2`,
 		gcid, demoSeedGrantKey(gcid)).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
+	}
+	return n
+}
+
+// userRowCount counts the seeded user rows — the third write the seed's
+// transaction must roll back with the wallet and the ledger.
+func userRowCount(t *testing.T, q rowQuerier, ctx context.Context, gcid string) int {
+	t.Helper()
+	var n int
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM users WHERE gcid = $1`, gcid).Scan(&n); err != nil {
+		t.Fatalf("read user: %v", err)
 	}
 	return n
 }
@@ -99,12 +135,13 @@ func ledgerCount(t *testing.T, tx pgx.Tx, ctx context.Context, gcid string) int 
 func TestIntegration_SeedDemoGrant_CreditsWalletAndLedger(t *testing.T) {
 
 	tenantID := uuid.NewString()
-	tx, ctx := seedDemoTx(t, seedDemoPool(t), tenantID)
+	pool := seedDemoPool(t)
+	tx, ctx := seedDemoTx(t, pool, tenantID)
 	seedDemoTenant(t, tx, ctx, tenantID)
 
 	u := seedUser{
 		Username: "demoit-" + uuid.NewString()[:8],
-		Email:    "demoit@example.com",
+		Email:    "demoit-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
 		Role:     identity.RoleAdmin,
 	}
@@ -117,11 +154,15 @@ func TestIntegration_SeedDemoGrant_CreditsWalletAndLedger(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	if got := walletBalance(t, tx, ctx, gcid); got != demoSeedGrantUnits {
+	read := scopedReadTx(t, pool, ctx, gcid)
+	if got := walletBalance(t, read, ctx, gcid); got != demoSeedGrantUnits {
 		t.Errorf("balance = %d, want %d", got, demoSeedGrantUnits)
 	}
-	if n := ledgerCount(t, tx, ctx, gcid); n != 1 {
+	if n := ledgerCount(t, read, ctx, gcid); n != 1 {
 		t.Errorf("ledger rows = %d, want 1", n)
+	}
+	if n := userRowCount(t, read, ctx, gcid); n != 1 {
+		t.Errorf("user rows = %d, want 1", n)
 	}
 }
 
@@ -130,12 +171,13 @@ func TestIntegration_SeedDemoGrant_CreditsWalletAndLedger(t *testing.T) {
 func TestIntegration_SeedDemoGrant_RerunAddsNothing(t *testing.T) {
 
 	tenantID := uuid.NewString()
-	tx, ctx := seedDemoTx(t, seedDemoPool(t), tenantID)
+	pool := seedDemoPool(t)
+	tx, ctx := seedDemoTx(t, pool, tenantID)
 	seedDemoTenant(t, tx, ctx, tenantID)
 
 	u := seedUser{
 		Username: "demoit-" + uuid.NewString()[:8],
-		Email:    "demoit2@example.com",
+		Email:    "demoit2-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
 		Role:     identity.RoleLearner,
 	}
@@ -151,10 +193,11 @@ func TestIntegration_SeedDemoGrant_RerunAddsNothing(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	if got := walletBalance(t, tx, ctx, gcid); got != demoSeedGrantUnits {
+	read := scopedReadTx(t, pool, ctx, gcid)
+	if got := walletBalance(t, read, ctx, gcid); got != demoSeedGrantUnits {
 		t.Errorf("balance = %d, want %d (credited once)", got, demoSeedGrantUnits)
 	}
-	if n := ledgerCount(t, tx, ctx, gcid); n != 1 {
+	if n := ledgerCount(t, read, ctx, gcid); n != 1 {
 		t.Errorf("ledger rows = %d, want 1", n)
 	}
 }
@@ -164,12 +207,13 @@ func TestIntegration_SeedDemoGrant_RerunAddsNothing(t *testing.T) {
 func TestIntegration_SeedDemoGrant_AfterSpendingPreservesSpentBalance(t *testing.T) {
 
 	tenantID := uuid.NewString()
-	tx, ctx := seedDemoTx(t, seedDemoPool(t), tenantID)
+	pool := seedDemoPool(t)
+	tx, ctx := seedDemoTx(t, pool, tenantID)
 	seedDemoTenant(t, tx, ctx, tenantID)
 
 	u := seedUser{
 		Username: "demoit-" + uuid.NewString()[:8],
-		Email:    "demoit3@example.com",
+		Email:    "demoit3-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
 		Role:     identity.RoleInstructor,
 	}
@@ -184,6 +228,8 @@ func TestIntegration_SeedDemoGrant_AfterSpendingPreservesSpentBalance(t *testing
 		gcid); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
+	// Read INSIDE the seed transaction: the uncommitted credit is not visible
+	// to any other connection.
 	before := walletBalance(t, tx, ctx, gcid)
 
 	if err := upsertUser(ctx, tx, tenantID, u); err != nil {
@@ -193,10 +239,11 @@ func TestIntegration_SeedDemoGrant_AfterSpendingPreservesSpentBalance(t *testing
 		t.Fatalf("commit: %v", err)
 	}
 
-	if got := walletBalance(t, tx, ctx, gcid); got != before {
+	read := scopedReadTx(t, pool, ctx, gcid)
+	if got := walletBalance(t, read, ctx, gcid); got != before {
 		t.Errorf("balance = %d, want the spent balance %d (never reset)", got, before)
 	}
-	if n := ledgerCount(t, tx, ctx, gcid); n != 1 {
+	if n := ledgerCount(t, read, ctx, gcid); n != 1 {
 		t.Errorf("ledger rows = %d, want 1", n)
 	}
 }
@@ -206,12 +253,13 @@ func TestIntegration_SeedDemoGrant_AfterSpendingPreservesSpentBalance(t *testing
 func TestIntegration_SeedDemoGrant_TransactionFailureChangesNeither(t *testing.T) {
 
 	tenantID := uuid.NewString()
-	tx, ctx := seedDemoTx(t, seedDemoPool(t), tenantID)
+	pool := seedDemoPool(t)
+	tx, ctx := seedDemoTx(t, pool, tenantID)
 	seedDemoTenant(t, tx, ctx, tenantID)
 
 	u := seedUser{
 		Username: "demoit-" + uuid.NewString()[:8],
-		Email:    "demoit4@example.com",
+		Email:    "demoit4-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
 		Role:     identity.RoleAdmin,
 	}
@@ -229,10 +277,16 @@ func TestIntegration_SeedDemoGrant_TransactionFailureChangesNeither(t *testing.T
 		t.Fatalf("rollback: %v", err)
 	}
 
-	if got := walletBalance(t, tx, ctx, gcid); got != 0 {
+	read := scopedReadTx(t, pool, ctx, gcid)
+	if got := walletBalance(t, read, ctx, gcid); got != 0 {
 		t.Errorf("balance = %d, want 0 — a failed seed must not credit", got)
 	}
-	if n := ledgerCount(t, tx, ctx, gcid); n != 0 {
+	if n := ledgerCount(t, read, ctx, gcid); n != 0 {
 		t.Errorf("ledger rows = %d, want 0", n)
+	}
+	// The user row and its credential/membership rows roll back with the grant:
+	// a failed seed must not leave a half-provisioned account behind.
+	if n := userRowCount(t, read, ctx, gcid); n != 0 {
+		t.Errorf("user rows = %d, want 0", n)
 	}
 }

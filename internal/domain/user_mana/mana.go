@@ -75,8 +75,15 @@ func (m *UserMana) Credit(units int64) error {
 	if units <= 0 {
 		return errors.New("user_mana: credit units must be > 0")
 	}
-	m.BalanceUnits += units
-	m.LifetimeEarned += units
+	balance, err := CheckedAddUnits(m.BalanceUnits, units)
+	if err != nil {
+		return err
+	}
+	earned, err := CheckedAddUnits(m.LifetimeEarned, units)
+	if err != nil {
+		return err
+	}
+	m.BalanceUnits, m.LifetimeEarned = balance, earned
 	now := time.Now().UTC()
 	m.LastCreditedAt = &now
 	m.touch()
@@ -92,8 +99,12 @@ func (m *UserMana) Debit(units int64) error {
 	if m.BalanceUnits < units {
 		return ErrInsufficientBalance
 	}
+	spent, err := CheckedAddUnits(m.LifetimeSpent, units)
+	if err != nil {
+		return err
+	}
 	m.BalanceUnits -= units
-	m.LifetimeSpent += units
+	m.LifetimeSpent = spent
 	m.touch()
 	return nil
 }
@@ -106,7 +117,11 @@ func (m *UserMana) Refund(units int64) error {
 	if m.LifetimeSpent < units {
 		return errors.New("user_mana: cannot refund more than lifetime_spent")
 	}
-	m.BalanceUnits += units
+	balance, err := CheckedAddUnits(m.BalanceUnits, units)
+	if err != nil {
+		return err
+	}
+	m.BalanceUnits = balance
 	m.LifetimeSpent -= units
 	m.touch()
 	return nil
@@ -174,6 +189,21 @@ type SubsidySlice struct {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+// ErrUnitsOverflow is returned when an arithmetic operation on mana units
+// cannot be represented in an int64. Go's `+=` wraps silently, so every
+// balance/earned/spent accumulation goes through CheckedAddUnits instead.
+var ErrUnitsOverflow = errors.New("user_mana: units overflow int64")
+
+// CheckedAddUnits adds two unit amounts, returning ErrUnitsOverflow when the
+// sum is not representable as an int64 (which Go would otherwise wrap).
+func CheckedAddUnits(a, b int64) (int64, error) {
+	sum := a + b
+	if (b > 0 && sum < a) || (b < 0 && sum > a) {
+		return 0, fmt.Errorf("%w: %d + %d", ErrUnitsOverflow, a, b)
+	}
+	return sum, nil
+}
 
 func validateGcid(gcid string) error {
 	if strings.TrimSpace(gcid) == "" {

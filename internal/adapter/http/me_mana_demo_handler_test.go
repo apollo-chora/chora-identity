@@ -326,6 +326,59 @@ func TestDemoGrant_GetMethod_Returns405(t *testing.T) {
 	}
 }
 
+func TestDemoGrant_ReusedKeyWithDifferentPayload_Returns409(t *testing.T) {
+	// The key is already recorded for a DIFFERENT operation (here: a manual
+	// grant of 500). Reporting a replay would silently accept the mismatch, so
+	// the handler must surface the idempotency conflict instead.
+	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
+
+	if _, err := store.CreditWallet(context.Background(), mana.CreditWalletInput{
+		Gcid: demoGcidA, Units: 500, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "k-conflict",
+	}); err != nil {
+		t.Fatalf("seed the conflicting entry: %v", err)
+	}
+
+	rec := doDemo(t, h, demoPost(demoGcidA, "k-conflict", ""))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "IDEMPOTENCY_KEY_CONFLICT") {
+		t.Errorf("body = %s, want IDEMPOTENCY_KEY_CONFLICT", rec.Body.String())
+	}
+	if got := mustBalance(t, store, demoGcidA); got != 500 {
+		t.Errorf("balance = %d, want the untouched 500", got)
+	}
+}
+
+func TestDemoGrant_ReplayAfterCapReached_StillReturns200(t *testing.T) {
+	// The idempotency re-check runs BEFORE the cap check inside the credit
+	// transaction, so re-sending a key that already granted must not start
+	// failing once the cap is reached.
+	cfg := demoEnabled(1_000_000)
+	cfg.MaxPerGcid = 1
+	h, store := newDemoServer(t, cfg, demoGcidA)
+
+	if rec := doDemo(t, h, demoPost(demoGcidA, "k-first", "")); rec.Code != http.StatusOK {
+		t.Fatalf("first grant: status = %d", rec.Code)
+	}
+	// The cap is now exhausted for a NEW key...
+	if rec := doDemo(t, h, demoPost(demoGcidA, "k-second", "")); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("new key: status = %d, want 429", rec.Code)
+	}
+	// ...but replaying the granted key still succeeds.
+	rec := doDemo(t, h, demoPost(demoGcidA, "k-first", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replay: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if body := demoBody(t, rec); body["replayed"] != true {
+		t.Errorf("replayed = %v, want true", body["replayed"])
+	}
+	if got := mustBalance(t, store, demoGcidA); got != 1_000_000 {
+		t.Errorf("balance = %d, want 1000000", got)
+	}
+}
+
 // --- helpers -----------------------------------------------------------------
 
 func mustBalance(t *testing.T, store *mana.InMemoryStore, gcid string) int64 {

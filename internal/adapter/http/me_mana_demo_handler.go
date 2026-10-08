@@ -14,10 +14,17 @@
 // The grant amount is FIXED server-side (configurable, never from the request
 // body) and the GCID comes ONLY from the validated server-side session context
 // — never from a request parameter.
+//
+// CAPS ARE ENFORCED IN THE DATABASE TRANSACTION. The handler deliberately does
+// no idempotency/cap/budget decision of its own: those checks run inside the
+// same transaction that credits the wallet and appends the ledger row, under a
+// transaction-scoped GCID lock plus row locks on the shared demo-grant budget
+// counters. Anything checked outside that transaction is a check two concurrent
+// requests can both pass.
 package httpadapter
 
 import (
-	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -39,10 +46,13 @@ type DemoManaConfig struct {
 	// GrantUnits is the fixed per-grant amount. NEVER read from the request.
 	GrantUnits int64
 
-	// MaxPerGcid is the number of demo grants one GCID may claim.
+	// MaxPerGcid is the number of INTERACTIVE demo grants one GCID may claim.
+	// 0 means uncapped. The one-time seed grant is account provisioning and is
+	// NOT counted against it.
 	MaxPerGcid int64
 
-	// TotalBudgetUnits is the platform-wide demo grant budget.
+	// TotalBudgetUnits is the platform-wide budget for INTERACTIVE demo grants.
+	// 0 means uncapped. The seed grant does not consume it.
 	TotalBudgetUnits int64
 }
 
@@ -90,63 +100,41 @@ func (h *DemoManaHandler) demoGrant(w http.ResponseWriter, r *http.Request) {
 	// GCID comes ONLY from the validated server-side session context.
 	gcid := gcidFromContext(ctx)
 
-	// Idempotent replay short-circuit: a repeated key returns the original
-	// grant WITHOUT re-checking the caps (a replay must not start failing once
-	// the cap is reached) and without crediting again. The balance reported is
-	// the caller's CURRENT balance, not the one stamped on the original row.
-	if existing, err := h.manaStore.FindLedgerByIdempotencyKey(ctx, gcid, key); err == nil && len(existing) > 0 {
-		bal, berr := h.currentBalance(ctx, gcid)
-		if berr != nil {
-			log.Printf("demoGrant: balance read for gcid=%s: %v", gcid, berr)
-			writeError(w, http.StatusInternalServerError, "DEMO_REPO_ERROR", "demo grant failed")
-			return
-		}
-		h.audit(gcid, key, existing[0].Units, true, bal)
-		writeJSON(w, http.StatusOK, demoGrantResponse{
-			GrantedUnits: existing[0].Units,
-			BalanceUnits: bal,
-			Replayed:     true,
-			Reason:       string(existing[0].Reason),
-		})
-		return
-	}
-
-	// Per-GCID cap.
-	reason := mana.ReasonDemoGrant
-	used, err := h.manaStore.ListLedger(ctx, mana.LedgerFilter{Gcid: gcid, Reason: &reason})
-	if err != nil {
-		log.Printf("demoGrant: list ledger for gcid=%s: %v", gcid, err)
-		writeError(w, http.StatusInternalServerError, "DEMO_REPO_ERROR", "demo grant failed")
-		return
-	}
-	if h.cfg.MaxPerGcid > 0 && int64(len(used)) >= h.cfg.MaxPerGcid {
-		writeError(w, http.StatusTooManyRequests, "DEMO_GRANT_LIMIT_REACHED",
-			"demo mana grant limit reached for this account")
-		return
-	}
-
-	// Platform-wide budget. Read through the SECURITY DEFINER helper (migration
-	// 0043) because the caller's own RLS scope cannot see other GCIDs' grants.
-	spent, err := h.manaStore.SumLedgerUnitsByReason(ctx, mana.ReasonDemoGrant)
-	if err != nil {
-		log.Printf("demoGrant: budget read for gcid=%s: %v", gcid, err)
-		writeError(w, http.StatusInternalServerError, "DEMO_REPO_ERROR", "demo grant failed")
-		return
-	}
-	if h.cfg.TotalBudgetUnits > 0 && spent+h.cfg.GrantUnits > h.cfg.TotalBudgetUnits {
-		writeError(w, http.StatusTooManyRequests, "DEMO_GRANT_BUDGET_EXHAUSTED",
-			"demo mana grant budget exhausted")
-		return
-	}
-
+	// ONE transactional call enforces both caps and applies the grant. The caps
+	// are checked AFTER the per-GCID and budget row locks are taken and BEFORE
+	// anything is written, so two concurrent requests can neither exceed the
+	// platform-wide budget nor the per-GCID cap; and because the idempotency
+	// re-check happens in the same transaction, a repeated key replays the
+	// original grant (Replayed=true) without re-checking the caps or crediting
+	// again. Nothing here is decided outside the transaction — a check outside
+	// it is a check two concurrent requests can both pass.
 	res, err := h.manaStore.CreditWallet(ctx, mana.CreditWalletInput{
 		Gcid:           gcid,
 		Units:          h.cfg.GrantUnits,
 		Direction:      mana.DirectionMint,
 		Reason:         mana.ReasonDemoGrant,
 		IdempotencyKey: key,
+		DemoGrantCaps: &mana.DemoGrantCaps{
+			MaxPerGcid:  h.cfg.MaxPerGcid,
+			BudgetUnits: h.cfg.TotalBudgetUnits,
+		},
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, mana.ErrDemoGrantLimitReached):
+		writeError(w, http.StatusTooManyRequests, "DEMO_GRANT_LIMIT_REACHED",
+			"demo mana grant limit reached for this account")
+		return
+	case errors.Is(err, mana.ErrDemoGrantBudgetExhausted):
+		writeError(w, http.StatusTooManyRequests, "DEMO_GRANT_BUDGET_EXHAUSTED",
+			"demo mana grant budget exhausted")
+		return
+	case errors.Is(err, mana.ErrIdempotencyConflict):
+		// The same key was already used for a DIFFERENT operation. Reporting a
+		// replay here would silently accept the mismatch.
+		writeError(w, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT",
+			"Idempotency-Key was already used for a different operation")
+		return
+	case err != nil:
 		log.Printf("demoGrant: credit for gcid=%s: %v", gcid, err)
 		writeError(w, http.StatusInternalServerError, "DEMO_REPO_ERROR", "demo grant failed")
 		return
@@ -167,27 +155,6 @@ type demoGrantResponse struct {
 	BalanceUnits int64  `json:"balance_units"`
 	Replayed     bool   `json:"replayed"`
 	Reason       string `json:"reason"`
-}
-
-// currentBalance returns the caller's current spendable balance (subsidy slices
-// + personal), mirroring GET /api/v1/me/mana.
-func (h *DemoManaHandler) currentBalance(ctx context.Context, gcid string) (int64, error) {
-	wallet, err := h.manaStore.GetMana(ctx, gcid)
-	if err != nil {
-		return 0, err
-	}
-	bal := int64(0)
-	if wallet != nil {
-		bal = wallet.BalanceUnits
-	}
-	allocs, err := h.manaStore.ListAllocations(ctx, gcid)
-	if err != nil {
-		return 0, err
-	}
-	for _, a := range allocs {
-		bal += a.RemainingUnits
-	}
-	return bal, nil
 }
 
 // audit records every demo grant. It logs the GCID, the fixed amount, the

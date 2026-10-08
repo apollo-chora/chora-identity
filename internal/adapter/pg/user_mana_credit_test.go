@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -38,16 +39,20 @@ type creditStubTx struct {
 	mu      sync.Mutex
 	wallets map[string]*mana.UserMana
 	ledger  []*mana.LedgerEntry
+	budget  map[string][2]int64
 
 	failOn string // an Exec whose SQL contains this returns errCreditBoom
 	execs  []string
 }
 
 func newCreditStubTx() *creditStubTx {
-	return &creditStubTx{wallets: map[string]*mana.UserMana{}}
+	return &creditStubTx{
+		wallets: map[string]*mana.UserMana{},
+		budget:  map[string][2]int64{},
+	}
 }
 
-func (t *creditStubTx) snapshot() (map[string]*mana.UserMana, []*mana.LedgerEntry) {
+func (t *creditStubTx) snapshot() (map[string]*mana.UserMana, []*mana.LedgerEntry, map[string][2]int64) {
 	w := make(map[string]*mana.UserMana, len(t.wallets))
 	for k, v := range t.wallets {
 		clone := *v
@@ -55,12 +60,17 @@ func (t *creditStubTx) snapshot() (map[string]*mana.UserMana, []*mana.LedgerEntr
 	}
 	l := make([]*mana.LedgerEntry, len(t.ledger))
 	copy(l, t.ledger)
-	return w, l
+	b := make(map[string][2]int64, len(t.budget))
+	for k, v := range t.budget {
+		b[k] = v
+	}
+	return w, l, b
 }
 
-func (t *creditStubTx) restore(w map[string]*mana.UserMana, l []*mana.LedgerEntry) {
+func (t *creditStubTx) restore(w map[string]*mana.UserMana, l []*mana.LedgerEntry, b map[string][2]int64) {
 	t.wallets = w
 	t.ledger = l
+	t.budget = b
 }
 
 func (t *creditStubTx) Exec(_ context.Context, sql string, args ...any) error {
@@ -70,6 +80,19 @@ func (t *creditStubTx) Exec(_ context.Context, sql string, args ...any) error {
 	}
 	switch {
 	case strings.Contains(sql, "pg_advisory_xact_lock"):
+		return nil
+	case strings.Contains(sql, "INSERT INTO demo_grant_budget"):
+		key := args[0].(string)
+		if _, ok := t.budget[key]; !ok {
+			t.budget[key] = [2]int64{}
+		}
+		return nil
+	case strings.Contains(sql, "UPDATE demo_grant_budget"):
+		key := args[0].(string)
+		row := t.budget[key]
+		row[0] += args[1].(int64)
+		row[1]++
+		t.budget[key] = row
 		return nil
 	case strings.Contains(sql, "INSERT INTO mana_ledger"):
 		t.ledger = append(t.ledger, &mana.LedgerEntry{
@@ -91,6 +114,9 @@ func (t *creditStubTx) Exec(_ context.Context, sql string, args ...any) error {
 
 func (t *creditStubTx) QueryRow(_ context.Context, sql string, args ...any) Row {
 	switch {
+	case strings.Contains(sql, "FROM demo_grant_budget"):
+		row := t.budget[args[0].(string)]
+		return creditStubRow{vals: []any{row[0], row[1]}}
 	case strings.Contains(sql, "FROM mana_ledger"):
 		key := creditStubKey
 		if len(args) > 1 {
@@ -174,10 +200,10 @@ type creditStubTxr struct{ tx *creditStubTx }
 func (r *creditStubTxr) RunInUserTx(ctx context.Context, userGcid, role string, fn func(context.Context, Tx) error) error {
 	r.tx.mu.Lock()
 	defer r.tx.mu.Unlock()
-	w, l := r.tx.snapshot()
+	w, l, b := r.tx.snapshot()
 	err := fn(ctx, r.tx)
 	if err != nil {
-		r.tx.restore(w, l)
+		r.tx.restore(w, l, b)
 	}
 	return err
 }
@@ -555,9 +581,152 @@ func TestManaStore_CreditWallet_Validation(t *testing.T) {
 	}
 }
 
-func TestManaStore_SumLedgerUnitsByReason_InvalidReason(t *testing.T) {
+// TestManaStore_DemoGrantTotalUnits_FailsClosedWithoutElevatedReader proves the
+// cross-GCID total ERRORS when the elevated reader is unavailable. Reporting 0
+// would read as "nothing granted yet" to a budget check.
+func TestManaStore_DemoGrantTotalUnits_FailsClosedWithoutElevatedReader(t *testing.T) {
 	store := NewManaStore(&creditStubTxr{tx: newCreditStubTx()})
-	if _, err := store.SumLedgerUnitsByReason(context.Background(), "nope"); err == nil {
-		t.Fatal("SumLedgerUnitsByReason with an unknown reason must error")
+	total, err := store.DemoGrantTotalUnits(context.Background())
+	if err == nil {
+		t.Fatalf("DemoGrantTotalUnits err = nil (total=%d), want an error", total)
 	}
+	if total != 0 {
+		t.Errorf("total = %d, want 0 alongside the error", total)
+	}
+}
+
+// TestManaStore_CreditWallet_ReplayWithDifferentPayloadConflicts proves a
+// reused idempotency key is a CONFLICT — never a successful replay — when the
+// incoming operation differs from the recorded one.
+func TestManaStore_CreditWallet_ReplayWithDifferentPayloadConflicts(t *testing.T) {
+	cases := map[string]func(*mana.CreditWalletInput){
+		"different units":     func(in *mana.CreditWalletInput) { in.Units = 999 },
+		"different direction": func(in *mana.CreditWalletInput) { in.Direction = mana.DirectionCredit },
+		"different reason":    func(in *mana.CreditWalletInput) { in.Reason = mana.ReasonPromo },
+		"different source":    func(in *mana.CreditWalletInput) { in.SourceTopupID = "topup-9" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			tx := newCreditStubTx()
+			store := NewManaStore(&creditStubTxr{tx: tx})
+			ctx := context.Background()
+
+			if _, err := store.CreditWallet(ctx, creditStubInput()); err != nil {
+				t.Fatalf("first credit: %v", err)
+			}
+			in := creditStubInput()
+			mutate(&in)
+			_, err := store.CreditWallet(ctx, in)
+			if !errors.Is(err, mana.ErrIdempotencyConflict) {
+				t.Fatalf("err = %v, want ErrIdempotencyConflict", err)
+			}
+			if got := tx.wallets[creditStubGcid].BalanceUnits; got != 1_000_000_000 {
+				t.Errorf("balance = %d, want 1e9 — a conflict must not credit", got)
+			}
+			if len(tx.ledger) != 1 {
+				t.Errorf("ledger rows = %d, want 1", len(tx.ledger))
+			}
+		})
+	}
+}
+
+// TestManaStore_CreditWallet_OverflowIsDomainError proves the credit uses
+// checked arithmetic: a balance that cannot absorb the credit fails with
+// ErrUnitsOverflow instead of wrapping negative.
+func TestManaStore_CreditWallet_OverflowIsDomainError(t *testing.T) {
+	tx := newCreditStubTx()
+	tx.wallets[creditStubGcid] = &mana.UserMana{
+		Gcid: creditStubGcid, BalanceUnits: math.MaxInt64, LifetimeEarned: math.MaxInt64, Version: 1,
+	}
+	store := NewManaStore(&creditStubTxr{tx: tx})
+
+	_, err := store.CreditWallet(context.Background(), creditStubInput())
+	if !errors.Is(err, mana.ErrUnitsOverflow) {
+		t.Fatalf("err = %v, want ErrUnitsOverflow", err)
+	}
+	if got := tx.wallets[creditStubGcid].BalanceUnits; got != math.MaxInt64 {
+		t.Errorf("balance = %d, want the unchanged MaxInt64", got)
+	}
+	if len(tx.ledger) != 0 {
+		t.Errorf("ledger rows = %d, want 0 — the failed credit must not append", len(tx.ledger))
+	}
+}
+
+// TestManaStore_CreditWallet_DemoGrantCaps proves the caps are enforced in the
+// transaction: the per-GCID cap stops the N+1th grant, the platform budget
+// stops a grant that would overshoot it, and a capped rejection writes nothing
+// (wallet, ledger and counters all unchanged).
+func TestManaStore_CreditWallet_DemoGrantCaps(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("per-gcid cap", func(t *testing.T) {
+		tx := newCreditStubTx()
+		store := NewManaStore(&creditStubTxr{tx: tx})
+		caps := &mana.DemoGrantCaps{MaxPerGcid: 2, BudgetUnits: 10_000_000_000}
+
+		for i, key := range []string{"k-1", "k-2"} {
+			in := creditStubInput()
+			in.IdempotencyKey = key
+			in.DemoGrantCaps = caps
+			if _, err := store.CreditWallet(ctx, in); err != nil {
+				t.Fatalf("grant %d: %v", i, err)
+			}
+		}
+		before := len(tx.ledger)
+		in := creditStubInput()
+		in.IdempotencyKey = "k-3"
+		in.DemoGrantCaps = caps
+		if _, err := store.CreditWallet(ctx, in); !errors.Is(err, mana.ErrDemoGrantLimitReached) {
+			t.Fatalf("err = %v, want ErrDemoGrantLimitReached", err)
+		}
+		if len(tx.ledger) != before {
+			t.Errorf("ledger rows = %d, want %d — a capped grant writes nothing", len(tx.ledger), before)
+		}
+	})
+
+	t.Run("platform budget", func(t *testing.T) {
+		tx := newCreditStubTx()
+		store := NewManaStore(&creditStubTxr{tx: tx})
+		in := creditStubInput()
+		in.Units = 600_000_000
+		in.DemoGrantCaps = &mana.DemoGrantCaps{MaxPerGcid: 10, BudgetUnits: 1_000_000_000}
+		if _, err := store.CreditWallet(ctx, in); err != nil {
+			t.Fatalf("first grant: %v", err)
+		}
+		// 600M + 600M > 1e9.
+		in.IdempotencyKey = "k-2"
+		if _, err := store.CreditWallet(ctx, in); !errors.Is(err, mana.ErrDemoGrantBudgetExhausted) {
+			t.Fatalf("err = %v, want ErrDemoGrantBudgetExhausted", err)
+		}
+		if len(tx.ledger) != 1 {
+			t.Errorf("ledger rows = %d, want 1", len(tx.ledger))
+		}
+		if got := tx.budget[demoBudgetGlobalKey]; got[0] != 600_000_000 || got[1] != 1 {
+			t.Errorf("global counter = %v, want [600000000 1] — a rejected grant must not charge", got)
+		}
+	})
+
+	t.Run("seed grants do not consume the interactive budget", func(t *testing.T) {
+		tx := newCreditStubTx()
+		store := NewManaStore(&creditStubTxr{tx: tx})
+		// The seed grant carries NO caps (cmd/seed → SeedDemoGrant).
+		seed := creditStubInput()
+		if _, err := store.CreditWallet(ctx, seed); err != nil {
+			t.Fatalf("seed-style credit: %v", err)
+		}
+		if _, ok := tx.budget[demoBudgetGlobalKey]; ok {
+			t.Errorf("seed credit touched the interactive budget: %v", tx.budget)
+		}
+		// The interactive grant still has its whole allowance.
+		in := creditStubInput()
+		in.IdempotencyKey = "interactive-1"
+		in.DemoGrantCaps = &mana.DemoGrantCaps{MaxPerGcid: 1, BudgetUnits: 1_000_000_000}
+		res, err := store.CreditWallet(ctx, in)
+		if err != nil {
+			t.Fatalf("interactive grant after seed: %v", err)
+		}
+		if res.Replayed {
+			t.Error("interactive grant reported a replay")
+		}
+	})
 }

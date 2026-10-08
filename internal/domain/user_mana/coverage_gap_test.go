@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,6 @@ type faultStore struct {
 	findKeyErr   error
 	listLedErr   error
 	creditWalErr error
-	sumReasonErr error
 }
 
 func (s *faultStore) GetMana(ctx context.Context, gcid string) (*mana.UserMana, error) {
@@ -95,13 +95,6 @@ func (s *faultStore) CreditWallet(ctx context.Context, in mana.CreditWalletInput
 		return nil, s.creditWalErr
 	}
 	return s.InMemoryStore.CreditWallet(ctx, in)
-}
-
-func (s *faultStore) SumLedgerUnitsByReason(ctx context.Context, reason mana.Reason) (int64, error) {
-	if s.sumReasonErr != nil {
-		return 0, s.sumReasonErr
-	}
-	return s.InMemoryStore.SumLedgerUnitsByReason(ctx, reason)
 }
 
 func newFaultStore() *faultStore {
@@ -1043,41 +1036,138 @@ func TestInMemoryStore_CreditWallet_Validation(t *testing.T) {
 	}
 }
 
-func TestInMemoryStore_SumLedgerUnitsByReason(t *testing.T) {
+func TestInMemoryStore_DemoGrantTotalUnits(t *testing.T) {
 	t.Parallel()
 	store := mana.NewInMemoryStore()
 	ctx := context.Background()
-	credit := func(gcid, key string, units int64) {
+	credit := func(gcid, key string, units int64, reason mana.Reason) {
 		t.Helper()
 		if _, err := store.CreditWallet(ctx, mana.CreditWalletInput{
 			Gcid: gcid, Units: units, Direction: mana.DirectionMint,
-			Reason: mana.ReasonDemoGrant, IdempotencyKey: key,
+			Reason: reason, IdempotencyKey: key,
 		}); err != nil {
 			t.Fatalf("credit %s: %v", key, err)
 		}
 	}
-	credit("g-a", "s-1", 100)
-	credit("g-b", "s-2", 250)
-	credit("g-a", "s-3", 50)
+	credit("g-a", "s-1", 100, mana.ReasonDemoGrant)
+	credit("g-b", "s-2", 250, mana.ReasonDemoGrant)
+	credit("g-a", "s-3", 50, mana.ReasonDemoGrant)
+	credit("g-a", "t-1", 7_000, mana.ReasonTopup)
 
-	if got := mustSum(t, store, mana.ReasonDemoGrant); got != 400 {
+	// The elevated total is demo-grant-only: a topup never inflates it.
+	if got := mustSum(t, store); got != 400 {
 		t.Errorf("demo_grant total = %d, want 400", got)
-	}
-	if got := mustSum(t, store, mana.ReasonTopup); got != 0 {
-		t.Errorf("topup total = %d, want 0", got)
-	}
-	if _, err := store.SumLedgerUnitsByReason(ctx, "nope"); err == nil {
-		t.Fatal("an unknown reason must error")
 	}
 }
 
-func mustSum(t *testing.T, store *mana.InMemoryStore, reason mana.Reason) int64 {
+func mustSum(t *testing.T, store *mana.InMemoryStore) int64 {
 	t.Helper()
-	got, err := store.SumLedgerUnitsByReason(context.Background(), reason)
+	got, err := store.DemoGrantTotalUnits(context.Background())
 	if err != nil {
-		t.Fatalf("SumLedgerUnitsByReason(%s): %v", reason, err)
+		t.Fatalf("DemoGrantTotalUnits: %v", err)
 	}
 	return got
+}
+
+// TestInMemoryStore_CreditWallet_ReplayWithDifferentPayloadConflicts proves a
+// reused idempotency key whose operation differs is a conflict, not a replay.
+func TestInMemoryStore_CreditWallet_ReplayWithDifferentPayloadConflicts(t *testing.T) {
+	t.Parallel()
+	store := mana.NewInMemoryStore()
+	ctx := context.Background()
+	base := mana.CreditWalletInput{
+		Gcid: "g-conflict", Units: 100, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "k-1",
+	}
+	if _, err := store.CreditWallet(ctx, base); err != nil {
+		t.Fatalf("first credit: %v", err)
+	}
+	other := base
+	other.Units = 101
+	if _, err := store.CreditWallet(ctx, other); !errors.Is(err, mana.ErrIdempotencyConflict) {
+		t.Fatalf("err = %v, want ErrIdempotencyConflict", err)
+	}
+	m, err := store.GetMana(ctx, "g-conflict")
+	if err != nil {
+		t.Fatalf("GetMana: %v", err)
+	}
+	if m.BalanceUnits != 100 {
+		t.Errorf("balance = %d, want 100 — a conflict must not credit", m.BalanceUnits)
+	}
+}
+
+// TestInMemoryStore_CreditWallet_DemoGrantCaps proves the in-memory store
+// enforces the same caps as the pg transaction, and that a credit WITHOUT caps
+// (the seed grant) leaves the interactive budget untouched.
+func TestInMemoryStore_CreditWallet_DemoGrantCaps(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	caps := &mana.DemoGrantCaps{MaxPerGcid: 1, BudgetUnits: 1_000}
+
+	store := mana.NewInMemoryStore()
+	first := mana.CreditWalletInput{
+		Gcid: "g-cap", Units: 600, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "k-1", DemoGrantCaps: caps,
+	}
+	if _, err := store.CreditWallet(ctx, first); err != nil {
+		t.Fatalf("first grant: %v", err)
+	}
+	// Same GCID, different key → per-GCID cap.
+	second := first
+	second.IdempotencyKey = "k-2"
+	if _, err := store.CreditWallet(ctx, second); !errors.Is(err, mana.ErrDemoGrantLimitReached) {
+		t.Fatalf("err = %v, want ErrDemoGrantLimitReached", err)
+	}
+	// Another GCID → global budget (600 + 600 > 1000).
+	third := second
+	third.Gcid, third.IdempotencyKey = "g-other", "k-3"
+	if _, err := store.CreditWallet(ctx, third); !errors.Is(err, mana.ErrDemoGrantBudgetExhausted) {
+		t.Fatalf("err = %v, want ErrDemoGrantBudgetExhausted", err)
+	}
+	// A rejected grant writes nothing.
+	if m, _ := store.GetMana(ctx, "g-other"); m != nil {
+		t.Errorf("g-other wallet = %+v, want nil", m)
+	}
+	if got := mustSum(t, store); got != 600 {
+		t.Errorf("total = %d, want 600 — rejected grants must not consume budget", got)
+	}
+
+	// A seed-style credit (no caps) does not consume the interactive budget.
+	seed := third
+	seed.Gcid, seed.IdempotencyKey, seed.DemoGrantCaps = "g-seed", "seed-1", nil
+	if _, err := store.CreditWallet(ctx, seed); err != nil {
+		t.Fatalf("seed credit: %v", err)
+	}
+	fourth := third
+	fourth.Gcid, fourth.IdempotencyKey, fourth.Units = "g-other", "k-4", 400
+	if _, err := store.CreditWallet(ctx, fourth); err != nil {
+		t.Fatalf("grant after seed: %v — the seed must not consume the budget", err)
+	}
+}
+
+// TestInMemoryStore_CreditWallet_OverflowIsDomainError proves the in-memory
+// credit rejects an addition that cannot fit in an int64.
+func TestInMemoryStore_CreditWallet_OverflowIsDomainError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := mana.NewInMemoryStore()
+	if _, err := store.CreditWallet(ctx, mana.CreditWalletInput{
+		Gcid: "g-max", Units: math.MaxInt64, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "k-1",
+	}); err != nil {
+		t.Fatalf("first credit: %v", err)
+	}
+	_, err := store.CreditWallet(ctx, mana.CreditWalletInput{
+		Gcid: "g-max", Units: 1, Direction: mana.DirectionMint,
+		Reason: mana.ReasonDemoGrant, IdempotencyKey: "k-2",
+	})
+	if !errors.Is(err, mana.ErrUnitsOverflow) {
+		t.Fatalf("err = %v, want ErrUnitsOverflow", err)
+	}
+	m, _ := store.GetMana(ctx, "g-max")
+	if m.BalanceUnits != math.MaxInt64 {
+		t.Errorf("balance = %d, want the unchanged MaxInt64", m.BalanceUnits)
+	}
 }
 
 func TestValidateCreditWalletInput(t *testing.T) {

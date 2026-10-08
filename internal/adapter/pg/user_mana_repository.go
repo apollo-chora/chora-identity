@@ -21,12 +21,13 @@
 // ⚠ Cross-method atomicity — CLOSED for the personal-balance credit path.
 // The port additionally exposes CreditWallet (wallet credit + ledger row in
 // ONE pgx transaction, with a pre-write idempotency lookup plus an in-tx
-// advisory-lock re-check), and CreditMana routes every non-subsidy source
-// through it. A crash between the wallet write and the ledger insert can no
-// longer leave balance != ledger on those paths. The tenant-subsidy path
-// still writes the Allocation and the wallet separately (it is a two-table
-// projection, not a single-account mutation); the dominant credit path
-// (Stripe top-up) is also protected upstream by the subscriber's
+// advisory-lock re-check, a payload check on replay, and the demo-grant caps
+// enforced under row locks inside the same transaction), and CreditMana routes
+// every non-subsidy source through it. A crash between the wallet write and the
+// ledger insert can no longer leave balance != ledger on those paths. The
+// tenant-subsidy path still writes the Allocation and the wallet separately (it
+// is a two-table projection, not a single-account mutation); the dominant
+// credit path (Stripe top-up) is also protected upstream by the subscriber's
 // idempotent.Store inbox (dedup BEFORE CreditMana), so at-least-once
 // redelivery does not double-credit.
 package pg
@@ -48,9 +49,10 @@ type ManaStore struct {
 	txr UserTxQuerier
 	// plainTxr is optional: set when the constructor was handed a querier that
 	// can also open a GUC-free transaction (production *PgxPoolQuerier does).
-	// The cross-GCID demo-grant budget read needs no RLS scope, so it cannot
-	// go through RunInUserTx. nil with a stub txr — SumLedgerUnitsByReason
-	// then reports 0 rather than failing a whole grant.
+	// The cross-GCID demo-grant total needs no RLS scope, so it cannot go
+	// through RunInUserTx. It FAILS CLOSED: with a stub txr — i.e. no elevated
+	// reader — DemoGrantTotalUnits returns an error rather than reporting an
+	// empty (zero) budget, which a budget check must never treat as "no spend".
 	plainTxr PlainTxQuerier
 }
 
@@ -159,18 +161,26 @@ func (s *ManaStore) AppendLedger(ctx context.Context, e *mana.LedgerEntry) error
 // One tx, in order:
 //  1. pg_advisory_xact_lock on (gcid, idempotency_key) — serializes
 //     concurrent duplicates of the SAME grant so exactly one can win.
-//  2. Re-check mana_ledger for the idempotency key. If a row is already there,
-//     return it with Replayed=true and write NOTHING. This closes the race
-//     left open by the caller's pre-write FindLedgerByIdempotencyKey lookup.
+//  2. Re-check mana_ledger for the idempotency key. If a row is already there
+//     AND it records the same operation, return it with Replayed=true and write
+//     NOTHING; if it records a different operation, fail with
+//     ErrIdempotencyConflict. This closes the race left open by the caller's
+//     pre-write FindLedgerByIdempotencyKey lookup.
+//  2b. When in.DemoGrantCaps is set, lock the GCID and the shared demo-grant
+//     budget rows and enforce the per-GCID cap and the platform-wide budget
+//     (checkDemoGrantCapsTx) — before anything is written.
 //  3. Lock/upsert the wallet row. ON CONFLICT DO UPDATE takes a row lock on an
 //     existing wallet, so concurrent credits to the same wallet serialize
 //     instead of one losing to an optimistic-concurrency conflict.
-//  4. Apply the credit: balance_units += units, lifetime_earned += units,
-//     last_credited_at / version / updated_at bumped.
+//  4. Apply the credit with CHECKED arithmetic: balance_units += units and
+//     lifetime_earned += units, last_credited_at / version / updated_at bumped.
+//     An int64 overflow is a domain error, never a wrapped balance.
 //  5. Write the wallet back and insert the ledger row.
+//  6. Charge the demo-grant counters, when caps were enforced.
 //
 // A crash anywhere in there rolls the whole unit back, so the balance can
-// never diverge from the ledger on this path.
+// never diverge from the ledger on this path — and a rejected cap can never
+// consume budget it did not grant.
 func (s *ManaStore) CreditWallet(ctx context.Context, in mana.CreditWalletInput) (*mana.CreditWalletResult, error) {
 	if err := mana.ValidateCreditWalletInput(in); err != nil {
 		return nil, err
@@ -210,49 +220,50 @@ func SeedDemoGrant(ctx context.Context, tx Tx, gcid, idempotencyKey string, unit
 
 // NewTxBridge adapts a pgx.Tx to the Tx interface, for callers that already
 // hold an open transaction (cmd/seed) and so cannot go through RunInUserTx.
-func NewTxBridge(tx pgx.Tx) Tx { return pgxTxBridge{tx: tx} }
+//
+// It reuses the pgxTx adapter RunInUserTx itself uses, so a Scan maps
+// pgx.ErrNoRows to the package's ErrNoRows exactly as the pool-backed path does.
+// The previous bridge returned the raw pgx.Row, so the in-transaction
+// idempotency re-check — a SELECT that finds nothing on the FIRST seed run —
+// surfaced pgx.ErrNoRows as a hard error ("no rows in result set") and the seed
+// grant could never be applied against a real database.
+func NewTxBridge(tx pgx.Tx) Tx { return &pgxTx{tx: tx} }
 
-// pgxTxBridge adapts a pgx.Tx to the Tx interface. *pgx.Tx.Exec returns a
-// CommandTag the repository layer discards, and pgx.Rows.Close() returns
-// nothing, so both need a thin wrapper; pgx.Row already matches Row.
-type pgxTxBridge struct{ tx pgx.Tx }
-
-func (b pgxTxBridge) Exec(ctx context.Context, sql string, args ...any) error {
-	_, err := b.tx.Exec(ctx, sql, args...)
-	return err
-}
-
-func (b pgxTxBridge) QueryRow(ctx context.Context, sql string, args ...any) Row {
-	return b.tx.QueryRow(ctx, sql, args...)
-}
-
-func (b pgxTxBridge) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
-	rows, err := b.tx.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
+// advisoryLockKeyTx takes a transaction-scoped advisory lock on a composite
+// (namespace, parts...) key.
+//
+// Each part is hashed on its own and the hashes are XOR-combined, so no part is
+// ever embedded in a SQL parameter: the previous implementation joined the parts
+// with "\x00", and a NUL byte is legal in a Go string but ILLEGAL in a Postgres
+// text parameter — every credit failed with SQLSTATE 22021 (invalid byte
+// sequence for encoding "UTF8") against a real database while the stub Tx
+// happily accepted it. Hashing the parts separately also removes the separator
+// ambiguity entirely.
+func advisoryLockKeyTx(ctx context.Context, tx Tx, namespace string, parts ...string) error {
+	expr := "hashtextextended($1, 0)"
+	args := []any{namespace}
+	for i, p := range parts {
+		expr += fmt.Sprintf(" # hashtextextended($%d, 0)", i+2)
+		args = append(args, p)
 	}
-	return pgxRowsBridge{rows: rows}, nil
+	if err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock("+expr+")", args...); err != nil {
+		return fmt.Errorf("pg.ManaStore advisory lock (%s): %w", namespace, err)
+	}
+	return nil
 }
-
-// pgxRowsBridge adapts pgx.Rows: Close() returns nothing in pgx.
-type pgxRowsBridge struct{ rows pgx.Rows }
-
-func (b pgxRowsBridge) Next() bool             { return b.rows.Next() }
-func (b pgxRowsBridge) Scan(dest ...any) error { return b.rows.Scan(dest...) }
-func (b pgxRowsBridge) Close() error           { b.rows.Close(); return nil }
-func (b pgxRowsBridge) Err() error             { return b.rows.Err() }
 
 // creditWalletTx is the transactional core shared by CreditWallet (which opens
 // the RLS-scoped tx) and SeedDemoGrant (which is handed the seed's tx).
 func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*mana.CreditWalletResult, error) {
 	// 1. Serialize concurrent duplicates of this exact grant. The key mixes the
 	//    gcid and the idempotency key so distinct grants never contend.
-	if err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0)::bigint)`,
-		in.Gcid+"\x00"+in.IdempotencyKey); err != nil {
-		return nil, fmt.Errorf("pg.ManaStore.CreditWallet advisory lock: %w", err)
+	if err := advisoryLockKeyTx(ctx, tx, "mana-credit-grant", in.Gcid, in.IdempotencyKey); err != nil {
+		return nil, err
 	}
 
-	// 2. Idempotency re-check under the lock.
+	// 2. Idempotency re-check under the lock. A replay is only valid when the
+	//    recorded operation MATCHES the incoming one: the same key with a
+	//    different amount/direction/reason/source is a conflict, not a replay.
 	row := tx.QueryRow(ctx, `
 		SELECT entry_id, gcid, direction, units, reason,
 		       source_subscription_id, source_action_id, source_allocation_id, source_topup_id,
@@ -266,6 +277,9 @@ func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*man
 		return nil, fmt.Errorf("pg.ManaStore.CreditWallet idempotency recheck: %w", err)
 	}
 	if existing != nil {
+		if !mana.CreditWalletMatchesLedger(existing, in) {
+			return nil, fmt.Errorf("%w: gcid=%s key=%s", mana.ErrIdempotencyConflict, in.Gcid, in.IdempotencyKey)
+		}
 		wallet, err := getManaTx(ctx, tx, in.Gcid)
 		if err != nil {
 			return nil, err
@@ -282,15 +296,32 @@ func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*man
 		}, nil
 	}
 
+	// 2b. Demo-grant caps — INSIDE this transaction, after the locks and before
+	//     any write, so two concurrent requests can neither exceed the
+	//     platform-wide budget nor the per-GCID cap.
+	if in.DemoGrantCaps != nil {
+		if err := checkDemoGrantCapsTx(ctx, tx, in); err != nil {
+			return nil, err
+		}
+	}
+
 	// 3. Lock/upsert the wallet row (takes a row lock when it already exists).
 	wallet, err := lockWalletTx(ctx, tx, in.Gcid)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. Apply the credit.
-	wallet.BalanceUnits += in.Units
-	wallet.LifetimeEarned += in.Units
+	// 4. Apply the credit — checked arithmetic: a silently wrapping int64 would
+	//    corrupt the balance before SQL ever sees it.
+	balance, err := mana.CheckedAddUnits(wallet.BalanceUnits, in.Units)
+	if err != nil {
+		return nil, err
+	}
+	earned, err := mana.CheckedAddUnits(wallet.LifetimeEarned, in.Units)
+	if err != nil {
+		return nil, err
+	}
+	wallet.BalanceUnits, wallet.LifetimeEarned = balance, earned
 	now := time.Now().UTC()
 	wallet.LastCreditedAt = &now
 	wallet.UpdatedAt = now
@@ -305,7 +336,10 @@ func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*man
 	if err != nil {
 		return nil, err
 	}
-	balAfter := subsidy + written.BalanceUnits
+	balAfter, err := mana.CheckedAddUnits(subsidy, written.BalanceUnits)
+	if err != nil {
+		return nil, err
+	}
 
 	entry := &mana.LedgerEntry{
 		EntryID:              uuid.Must(uuid.NewV7()).String(),
@@ -325,6 +359,14 @@ func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*man
 	if err := insertLedgerTx(ctx, tx, entry); err != nil {
 		return nil, err
 	}
+
+	// 6. Consume the reserved budget/allowance. Same transaction as the credit,
+	//    so a failed ledger insert cannot leave the counters charged.
+	if in.DemoGrantCaps != nil {
+		if err := consumeDemoGrantBudgetTx(ctx, tx, in); err != nil {
+			return nil, err
+		}
+	}
 	return &mana.CreditWalletResult{
 		Wallet:            written,
 		Entry:             entry,
@@ -332,23 +374,128 @@ func creditWalletTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) (*man
 	}, nil
 }
 
-// SumLedgerUnitsByReason totals `reason` across ALL GCIDs via the SECURITY
-// DEFINER helper added by migration 0043. A plain SELECT would be filtered by
-// the user_isolation RLS policy (migration 0003) down to the caller's own
-// rows, and the runtime role is NOBYPASSRLS (migration 0025).
-func (s *ManaStore) SumLedgerUnitsByReason(ctx context.Context, reason mana.Reason) (int64, error) {
-	if !reason.Valid() {
-		return 0, fmt.Errorf("pg.ManaStore.SumLedgerUnitsByReason: invalid reason %q", reason)
+// demo-grant budget keys — the `demo_grant_budget.budget_key` values.
+const (
+	demoBudgetGlobalKey  = "global"
+	demoBudgetGcidPrefix = "gcid:"
+)
+
+// checkDemoGrantCapsTx enforces the demo-grant caps inside the credit
+// transaction.
+//
+// Locking, in order:
+//  1. pg_advisory_xact_lock on the GCID — serializes every demo grant for one
+//     user, so two requests with DIFFERENT idempotency keys cannot both pass
+//     the per-GCID cap. (The (gcid, key) lock in step 1 of creditWalletTx only
+//     serializes duplicates of the SAME grant.)
+//  2. the shared `global` budget row, then the GCID's own row, both
+//     SELECT ... FOR UPDATE. A fixed lock order (global → gcid) keeps concurrent
+//     grants deadlock-free.
+//
+// The checks run only AFTER both locks are held, and read the RESERVED/CONSUMED
+// counters rather than aggregating the ledger — an aggregate over the whole
+// ledger would be neither bounded nor serialized against concurrent credits.
+func checkDemoGrantCapsTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) error {
+	caps := in.DemoGrantCaps
+	if err := advisoryLockKeyTx(ctx, tx, "mana-demo-grant-gcid", in.Gcid); err != nil {
+		return err
 	}
+	globalUnits, _, err := lockDemoBudgetRowTx(ctx, tx, demoBudgetGlobalKey)
+	if err != nil {
+		return err
+	}
+	_, gcidGrants, err := lockDemoBudgetRowTx(ctx, tx, demoBudgetGcidPrefix+in.Gcid)
+	if err != nil {
+		return err
+	}
+	if caps.MaxPerGcid > 0 && gcidGrants >= caps.MaxPerGcid {
+		return fmt.Errorf("%w: gcid=%s grants=%d cap=%d",
+			mana.ErrDemoGrantLimitReached, in.Gcid, gcidGrants, caps.MaxPerGcid)
+	}
+	if caps.BudgetUnits > 0 {
+		projected, err := mana.CheckedAddUnits(globalUnits, in.Units)
+		if err != nil {
+			return err
+		}
+		if projected > caps.BudgetUnits {
+			return fmt.Errorf("%w: consumed=%d grant=%d budget=%d",
+				mana.ErrDemoGrantBudgetExhausted, globalUnits, in.Units, caps.BudgetUnits)
+		}
+	}
+	return nil
+}
+
+// lockDemoBudgetRowTx creates the row if absent and returns its consumed
+// counters, holding a row lock until the transaction ends.
+func lockDemoBudgetRowTx(ctx context.Context, tx Tx, key string) (units, grants int64, err error) {
+	if err := tx.Exec(ctx, `
+		INSERT INTO demo_grant_budget (budget_key) VALUES ($1)
+		ON CONFLICT (budget_key) DO NOTHING`, key); err != nil {
+		return 0, 0, fmt.Errorf("pg.ManaStore demo budget init: %w", err)
+	}
+	row := tx.QueryRow(ctx, `
+		SELECT consumed_units, consumed_grants
+		  FROM demo_grant_budget
+		 WHERE budget_key = $1
+		   FOR UPDATE`, key)
+	if err := row.Scan(&units, &grants); err != nil {
+		return 0, 0, fmt.Errorf("pg.ManaStore demo budget lock: %w", err)
+	}
+	return units, grants, nil
+}
+
+// consumeDemoGrantBudgetTx charges the reserved demo-grant counters for a
+// committed credit.
+func consumeDemoGrantBudgetTx(ctx context.Context, tx Tx, in mana.CreditWalletInput) error {
+	for _, key := range []string{demoBudgetGlobalKey, demoBudgetGcidPrefix + in.Gcid} {
+		if err := tx.Exec(ctx, `
+			UPDATE demo_grant_budget
+			   SET consumed_units  = consumed_units + $2,
+			       consumed_grants = consumed_grants + 1,
+			       updated_at      = now()
+			 WHERE budget_key = $1`, key, in.Units); err != nil {
+			return fmt.Errorf("pg.ManaStore demo budget consume: %w", err)
+		}
+	}
+	return nil
+}
+
+// noGcidSentinel is the UUID used to pin `chora.user_gcid` for reads that have
+// no user scope. See DemoGrantTotalUnits for why it must be set at all.
+const noGcidSentinel = "00000000-0000-7000-8000-000000000000"
+
+// DemoGrantTotalUnits totals the `demo_grant` units across ALL GCIDs via the
+// SECURITY DEFINER helper added by migration 0043 (tightened by 0044). A plain
+// SELECT would be filtered by the user_isolation RLS policy (migration 0003)
+// down to the caller's own rows, and the runtime role is NOBYPASSRLS
+// (migration 0025).
+//
+// FAIL CLOSED: when the elevated (GUC-free) reader is unavailable this returns
+// an error. It must never report 0 — a caller enforcing a budget would read a
+// zero total as "nothing has been granted" and hand out the whole budget again.
+func (s *ManaStore) DemoGrantTotalUnits(ctx context.Context) (int64, error) {
 	if s.plainTxr == nil {
-		return 0, nil
+		return 0, errors.New("pg.ManaStore.DemoGrantTotalUnits: no elevated querier wired (cross-GCID read unavailable)")
 	}
 	var out int64
 	err := s.plainTxr.RunInTx(ctx, func(ctx context.Context, tx Tx) error {
-		return tx.QueryRow(ctx, `SELECT mana_demo_grant_total_units()`).Scan(&out)
+		// `chora.user_gcid` is a PLACEHOLDER GUC: Postgres materializes it on
+		// the first SET of a session and, at the end of the setting
+		// transaction, reverts it to the EMPTY STRING rather than to "unset".
+		// Every pooled connection that has already served a RunInUserTx is
+		// therefore in a state where the user_isolation policy's
+		// `current_setting('chora.user_gcid', true)::uuid` raises SQLSTATE
+		// 22P02 (invalid input syntax for type uuid: ""). Pin the GUC to a UUID
+		// no account can hold so the elevated read is deterministic — what makes
+		// the cross-GCID rows visible is the helper's own role-targeted policy
+		// (migration 0044), not this scope.
+		if err := tx.Exec(ctx, `SET LOCAL chora.user_gcid = '`+noGcidSentinel+`'`); err != nil {
+			return fmt.Errorf("pg.ManaStore.DemoGrantTotalUnits: scope guc: %w", err)
+		}
+		return tx.QueryRow(ctx, `SELECT public.mana_demo_grant_total_units()`).Scan(&out)
 	})
 	if err != nil {
-		return 0, fmt.Errorf("pg.ManaStore.SumLedgerUnitsByReason: %w", err)
+		return 0, fmt.Errorf("pg.ManaStore.DemoGrantTotalUnits: %w", err)
 	}
 	return out, nil
 }
@@ -438,11 +585,10 @@ func balanceIncludingSubsidyTx(ctx context.Context, tx Tx, wallet *mana.UserMana
 	if err != nil {
 		return 0, err
 	}
-	bal := subsidy
-	if wallet != nil {
-		bal += wallet.BalanceUnits
+	if wallet == nil {
+		return subsidy, nil
 	}
-	return bal, nil
+	return mana.CheckedAddUnits(subsidy, wallet.BalanceUnits)
 }
 
 // insertLedgerTx appends one mana_ledger row.

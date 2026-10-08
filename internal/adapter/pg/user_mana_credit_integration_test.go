@@ -18,7 +18,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/apollo-chora/chora-identity/internal/adapter/pg"
@@ -42,8 +41,8 @@ func TestIntegration_CreditWallet_RLSIsolation(t *testing.T) {
 	pool := liveDB(t)
 	ctx := context.Background()
 
-	gcidA := uuid.NewString()
-	gcidB := uuid.NewString()
+	gcidA := integrationGcid(t, pool)
+	gcidB := integrationGcid(t, pool)
 
 	store := pg.NewManaStore(pg.NewPgxPoolQuerier(pool))
 	if _, err := store.CreditWallet(ctx, creditWalletInput(gcidA, "rls-a", 100)); err != nil {
@@ -103,7 +102,7 @@ func TestIntegration_CreditWallet_ConcurrentDuplicatesGrantExactlyOnce(t *testin
 	pool := liveDB(t)
 	ctx := context.Background()
 
-	gcid := uuid.NewString()
+	gcid := integrationGcid(t, pool)
 	store := pg.NewManaStore(pg.NewPgxPoolQuerier(pool))
 
 	const workers = 12
@@ -146,7 +145,7 @@ func TestIntegration_CreditWallet_LedgerFailureLeavesWalletUnchanged(t *testing.
 	pool := liveDB(t)
 	ctx := context.Background()
 
-	gcid := uuid.NewString()
+	gcid := integrationGcid(t, pool)
 	store := pg.NewManaStore(pg.NewPgxPoolQuerier(pool))
 
 	// A key that is already 129 chars long overflows idempotency_key
@@ -180,7 +179,7 @@ func TestIntegration_CreditWallet_ReplayAfterSpendingPreservesSpentBalance(t *te
 	pool := liveDB(t)
 	ctx := context.Background()
 
-	gcid := uuid.NewString()
+	gcid := integrationGcid(t, pool)
 	store := pg.NewManaStore(pg.NewPgxPoolQuerier(pool))
 
 	if _, err := store.CreditWallet(ctx, creditWalletInput(gcid, "spend-key", 1_000_000)); err != nil {

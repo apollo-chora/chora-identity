@@ -30,13 +30,21 @@ type Store interface {
 	// row. Implementations MUST make the wallet write and the ledger insert
 	// ATOMIC (one transaction) so a crash cannot leave balance != ledger, and
 	// MUST honour (gcid, idempotency_key): a repeat call returns Replayed=true
-	// without crediting again.
+	// without crediting again — but ONLY when the replayed operation matches the
+	// incoming one (see CreditWalletMatchesLedger); a reused key describing a
+	// different operation MUST fail with ErrIdempotencyConflict.
+	//
+	// When in.DemoGrantCaps is set the demo-grant caps are enforced INSIDE the
+	// same transaction (see DemoGrantCaps).
 	CreditWallet(ctx context.Context, in CreditWalletInput) (*CreditWalletResult, error)
-	// SumLedgerUnitsByReason totals `reason` across ALL GCIDs. This is the
-	// cross-user budget axis: an RLS-scoped implementation can only see the
-	// caller's own rows, so the pg adapter reads it through a SECURITY DEFINER
-	// helper (migration 0043).
-	SumLedgerUnitsByReason(ctx context.Context, reason Reason) (int64, error)
+	// DemoGrantTotalUnits totals the `demo_grant` units recorded across ALL
+	// GCIDs. This is the cross-user budget axis: an RLS-scoped implementation
+	// can only see the caller's own rows, so the pg adapter reads it through a
+	// SECURITY DEFINER helper (migration 0043). It is deliberately restricted to
+	// the demo-grant reason — it is not a general per-reason aggregation port —
+	// and MUST fail closed: an implementation whose elevated reader is
+	// unavailable returns an error, never a zero total.
+	DemoGrantTotalUnits(ctx context.Context) (int64, error)
 }
 
 // Quoter is the domain service for credit/debit Mana operations.
@@ -466,6 +474,24 @@ type CreditWalletInput struct {
 	SourceActionID       string
 	SourceAllocationID   string
 	SourceTopupID        string
+	// DemoGrantCaps, when non-nil, makes the credit enforce the DEMO-GRANT caps
+	// in the same transaction that writes the wallet and the ledger row. nil for
+	// every other credit path (and for the seed grant, whose grants are one-time
+	// account provisioning and must NOT consume the interactive demo budget).
+	DemoGrantCaps *DemoGrantCaps
+}
+
+// DemoGrantCaps are the demo-grant limits enforced transactionally by
+// CreditWallet. Both are reserved/consumed counters, not aggregations over the
+// ledger, so the check and the consumption are serialized by the row locks the
+// adapter takes before crediting.
+type DemoGrantCaps struct {
+	// MaxPerGcid caps the number of INTERACTIVE demo grants one GCID may claim
+	// (0 = uncapped).
+	MaxPerGcid int64
+	// BudgetUnits caps the platform-wide total units the interactive demo grant
+	// may mint (0 = uncapped).
+	BudgetUnits int64
 }
 
 // CreditWalletResult is the outcome of an atomic wallet credit.
@@ -482,6 +508,19 @@ type CreditWalletResult struct {
 	// that NO credit was made.
 	Replayed bool
 }
+
+// Demo-grant and idempotency errors. They are sentinels so the HTTP adapter can
+// map them to 429/409 instead of a generic 500.
+var (
+	// ErrDemoGrantLimitReached — the per-GCID demo grant cap is exhausted.
+	ErrDemoGrantLimitReached = errors.New("user_mana: demo grant limit reached for this gcid")
+	// ErrDemoGrantBudgetExhausted — the platform-wide demo grant budget is
+	// exhausted.
+	ErrDemoGrantBudgetExhausted = errors.New("user_mana: demo grant budget exhausted")
+	// ErrIdempotencyConflict — the idempotency key was already used for a
+	// DIFFERENT operation (see CreditWalletMatchesLedger).
+	ErrIdempotencyConflict = errors.New("user_mana: idempotency key reused with a different operation")
+)
 
 // ValidateCreditWalletInput enforces the invariants every CreditWallet
 // implementation relies on, so the pg and in-memory adapters reject the same
@@ -502,7 +541,32 @@ func ValidateCreditWalletInput(in CreditWalletInput) error {
 	if strings.TrimSpace(in.IdempotencyKey) == "" {
 		return errors.New("user_mana: idempotency_key required")
 	}
+	if c := in.DemoGrantCaps; c != nil && (c.MaxPerGcid < 0 || c.BudgetUnits < 0) {
+		return fmt.Errorf("user_mana: demo grant caps must be >= 0; got max_per_gcid=%d budget=%d",
+			c.MaxPerGcid, c.BudgetUnits)
+	}
 	return nil
+}
+
+// CreditWalletMatchesLedger reports whether the ledger entry e records exactly
+// the operation in describes.
+//
+// A (gcid, idempotency_key) replay is only valid when the ORIGINAL operation
+// matches the incoming one. Reusing a key with a different amount, direction,
+// reason or source identifier is an idempotency CONFLICT, never a successful
+// replay. RequestID is excluded: it is a per-request trace id, so a legitimate
+// retry carries a different one.
+func CreditWalletMatchesLedger(e *LedgerEntry, in CreditWalletInput) bool {
+	if e == nil {
+		return false
+	}
+	return e.Units == in.Units &&
+		e.Direction == in.Direction &&
+		e.Reason == in.Reason &&
+		e.SourceSubscriptionID == in.SourceSubscriptionID &&
+		e.SourceActionID == in.SourceActionID &&
+		e.SourceAllocationID == in.SourceAllocationID &&
+		e.SourceTopupID == in.SourceTopupID
 }
 
 // CreditMana adds units to the user's wallet. For Source=tenant_subsidy a
@@ -572,7 +636,10 @@ func (q *Quoter) CreditMana(ctx context.Context, in CreditInput) (*CreditResult,
 		if err := q.store.SaveAllocation(ctx, in.Gcid, alloc); err != nil {
 			return nil, err
 		}
-		mana.LifetimeEarned += in.Units
+		mana.LifetimeEarned, err = CheckedAddUnits(mana.LifetimeEarned, in.Units)
+		if err != nil {
+			return nil, err
+		}
 		now := time.Now().UTC()
 		mana.LastCreditedAt = &now
 		// touch version
@@ -588,9 +655,15 @@ func (q *Quoter) CreditMana(ctx context.Context, in CreditInput) (*CreditResult,
 		allocs, _ := q.store.ListAllocations(ctx, in.Gcid)
 		subsidy := int64(0)
 		for _, a := range allocs {
-			subsidy += a.RemainingUnits
+			subsidy, err = CheckedAddUnits(subsidy, a.RemainingUnits)
+			if err != nil {
+				return nil, err
+			}
 		}
-		balAfter := subsidy + mana.BalanceUnits
+		balAfter, err := CheckedAddUnits(subsidy, mana.BalanceUnits)
+		if err != nil {
+			return nil, err
+		}
 		e, err := NewLedgerEntry(NewLedgerParams{
 			Gcid:                 in.Gcid,
 			Direction:            direction,
@@ -705,6 +778,16 @@ type InMemoryStore struct {
 	mana        map[string]*UserMana
 	allocations map[string][]*Allocation
 	ledger      []*LedgerEntry
+	// demoBudget mirrors the pg adapter's `demo_grant_budget` reserved/consumed
+	// counters (keyed "global" / "gcid:<gcid>"), so the in-memory store enforces
+	// the same demo-grant caps the pg transaction enforces. Lazily created.
+	demoBudget map[string]demoBudgetRow
+}
+
+// demoBudgetRow is one consumed-counter row of the demo-grant budget.
+type demoBudgetRow struct {
+	consumedUnits  int64
+	consumedGrants int64
 }
 
 // NewInMemoryStore returns an empty in-memory Store.
@@ -713,6 +796,7 @@ func NewInMemoryStore() *InMemoryStore {
 		mana:        make(map[string]*UserMana),
 		allocations: make(map[string][]*Allocation),
 		ledger:      make([]*LedgerEntry, 0),
+		demoBudget:  make(map[string]demoBudgetRow),
 	}
 }
 
@@ -876,7 +960,9 @@ func (s *InMemoryStore) UpdateAllocationRemaining(_ context.Context, gcid, alloc
 
 // CreditWallet applies an atomic credit: the wallet mutation and the ledger
 // append happen under ONE mutex, so the in-memory store has the same
-// atomicity guarantee the pg adapter gets from its single transaction.
+// atomicity guarantee the pg adapter gets from its single transaction. When
+// in.DemoGrantCaps is set the demo-grant caps are checked and consumed under
+// that same mutex, mirroring the pg adapter's transactional enforcement.
 func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*CreditWalletResult, error) {
 	if err := ValidateCreditWalletInput(in); err != nil {
 		return nil, err
@@ -885,10 +971,22 @@ func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*
 	defer s.mu.Unlock()
 
 	if existing := s.findLedgerLocked(in.Gcid, in.IdempotencyKey); len(existing) > 0 {
+		if !CreditWalletMatchesLedger(existing[0], in) {
+			return nil, fmt.Errorf("%w: gcid=%s key=%s", ErrIdempotencyConflict, in.Gcid, in.IdempotencyKey)
+		}
 		m, _ := s.mana[in.Gcid]
-		bal, _ := s.balanceIncludingSubsidyLocked(m, in.Gcid)
+		bal, err := s.balanceIncludingSubsidyLocked(m, in.Gcid)
+		if err != nil {
+			return nil, err
+		}
 		return &CreditWalletResult{Wallet: cloneMana(m), Entry: existing[0],
 			BalanceAfterUnits: bal, Replayed: true}, nil
+	}
+
+	if in.DemoGrantCaps != nil {
+		if err := s.consumeDemoBudgetLocked(in); err != nil {
+			return nil, err
+		}
 	}
 
 	m, ok := s.mana[in.Gcid]
@@ -900,6 +998,10 @@ func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*
 	}
 	s.mana[in.Gcid] = m
 
+	balAfter, err := s.balanceAfterLocked(m, in.Gcid)
+	if err != nil {
+		return nil, err
+	}
 	e, err := NewLedgerEntry(NewLedgerParams{
 		Gcid:                 in.Gcid,
 		Direction:            in.Direction,
@@ -911,7 +1013,7 @@ func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*
 		SourceTopupID:        in.SourceTopupID,
 		IdempotencyKey:       in.IdempotencyKey,
 		RequestID:            in.RequestID,
-		BalanceAfterUnits:    s.balanceAfterLocked(m, in.Gcid),
+		BalanceAfterUnits:    balAfter,
 	})
 	if err != nil {
 		return nil, err
@@ -921,19 +1023,66 @@ func (s *InMemoryStore) CreditWallet(_ context.Context, in CreditWalletInput) (*
 		BalanceAfterUnits: e.BalanceAfterUnits}, nil
 }
 
-// SumLedgerUnitsByReason totals `reason` across every gcid. The in-memory
-// store has no RLS, so this is a plain scan.
-func (s *InMemoryStore) SumLedgerUnitsByReason(_ context.Context, reason Reason) (int64, error) {
-	if !reason.Valid() {
-		return 0, fmt.Errorf("user_mana: invalid reason %q", reason)
+// consumeDemoBudgetLocked checks the demo-grant caps and consumes the counters.
+// Caller holds mu; it runs BEFORE the credit so a capped request writes nothing.
+func (s *InMemoryStore) consumeDemoBudgetLocked(in CreditWalletInput) error {
+	caps := in.DemoGrantCaps
+	globalKey := demoBudgetGlobalKey
+	gcidKey := demoBudgetGcidPrefix + in.Gcid
+	global := s.demoBudget[globalKey]
+	perGcid := s.demoBudget[gcidKey]
+
+	if caps.MaxPerGcid > 0 && perGcid.consumedGrants >= caps.MaxPerGcid {
+		return fmt.Errorf("%w: gcid=%s grants=%d cap=%d",
+			ErrDemoGrantLimitReached, in.Gcid, perGcid.consumedGrants, caps.MaxPerGcid)
 	}
+	if caps.BudgetUnits > 0 {
+		projected, err := CheckedAddUnits(global.consumedUnits, in.Units)
+		if err != nil {
+			return err
+		}
+		if projected > caps.BudgetUnits {
+			return fmt.Errorf("%w: consumed=%d grant=%d budget=%d",
+				ErrDemoGrantBudgetExhausted, global.consumedUnits, in.Units, caps.BudgetUnits)
+		}
+	}
+
+	globalUnits, err := CheckedAddUnits(global.consumedUnits, in.Units)
+	if err != nil {
+		return err
+	}
+	gcidUnits, err := CheckedAddUnits(perGcid.consumedUnits, in.Units)
+	if err != nil {
+		return err
+	}
+	global.consumedUnits, global.consumedGrants = globalUnits, global.consumedGrants+1
+	perGcid.consumedUnits, perGcid.consumedGrants = gcidUnits, perGcid.consumedGrants+1
+	s.demoBudget[globalKey], s.demoBudget[gcidKey] = global, perGcid
+	return nil
+}
+
+// demo-grant budget keys, mirroring the pg adapter's `demo_grant_budget`
+// budget_key values.
+const (
+	demoBudgetGlobalKey  = "global"
+	demoBudgetGcidPrefix = "gcid:"
+)
+
+// DemoGrantTotalUnits totals the `demo_grant` units across every gcid. The
+// in-memory store has no RLS, so this is a plain scan.
+func (s *InMemoryStore) DemoGrantTotalUnits(_ context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out int64
 	for _, e := range s.ledger {
-		if e.Reason == reason {
-			out += e.Units
+		if e.Reason != ReasonDemoGrant {
+			continue
 		}
+		sum, err := CheckedAddUnits(out, e.Units)
+		if err != nil {
+			return 0, err
+		}
+		out = sum
 	}
 	return out, nil
 }
@@ -955,20 +1104,24 @@ func (s *InMemoryStore) findLedgerLocked(gcid, key string) []*LedgerEntry {
 
 // balanceAfterLocked computes subsidy total + personal balance for the ledger
 // row's balance_after_units. Caller holds mu.
-func (s *InMemoryStore) balanceAfterLocked(m *UserMana, gcid string) int64 {
+func (s *InMemoryStore) balanceAfterLocked(m *UserMana, gcid string) (int64, error) {
 	bal := int64(0)
 	for _, a := range s.allocations[gcid] {
-		bal += a.RemainingUnits
+		sum, err := CheckedAddUnits(bal, a.RemainingUnits)
+		if err != nil {
+			return 0, err
+		}
+		bal = sum
 	}
 	if m != nil {
-		bal += m.BalanceUnits
+		return CheckedAddUnits(bal, m.BalanceUnits)
 	}
-	return bal
+	return bal, nil
 }
 
 // balanceIncludingSubsidyLocked is balanceAfterLocked with a nil-safe wallet.
 func (s *InMemoryStore) balanceIncludingSubsidyLocked(m *UserMana, gcid string) (int64, error) {
-	return s.balanceAfterLocked(m, gcid), nil
+	return s.balanceAfterLocked(m, gcid)
 }
 
 // cloneMana deep-copies a wallet snapshot (nil-safe). Caller holds mu.
