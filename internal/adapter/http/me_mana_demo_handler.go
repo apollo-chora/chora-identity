@@ -31,6 +31,7 @@
 package httpadapter
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/apollo-chora/chora-common/auth/chorasession"
 	"github.com/apollo-chora/chora-identity/internal/domain/identity"
 	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
 )
@@ -75,15 +77,23 @@ type DemoManaConfig struct {
 
 // ParseDemoManaAllowedGcids parses the comma-separated
 // CHORA_DEMO_MANA_ALLOWED_GCIDS value into an immutable set of canonical UUID
-// strings. It returns the set plus every entry it could not parse, so the
-// composition root can refuse to start on a malformed allowlist instead of
-// silently dropping an account the operator meant to allow.
-func ParseDemoManaAllowedGcids(raw string) (map[string]struct{}, []string) {
-	allowed := make(map[string]struct{})
-	var malformed []string
+// strings. It returns the set plus the entries it rejected, split by reason:
+//
+//   - malformed: present but not a GCID (UUID) — an account the operator never
+//     meant to allow;
+//   - empty: a blank slot in the comma-separated list (a trailing comma, or
+//     ", ," between entries).
+//
+// Both are reported rather than skipped so the composition root can refuse to
+// start on an allowlist it cannot honour exactly. Silently dropping an empty
+// slot is how "gcid-a, gcid-b," (trailing comma) becomes a two-account list
+// the operator never wrote.
+func ParseDemoManaAllowedGcids(raw string) (allowed map[string]struct{}, malformed, empty []string) {
+	allowed = make(map[string]struct{})
 	for _, part := range strings.Split(raw, ",") {
 		entry := strings.TrimSpace(part)
 		if entry == "" {
+			empty = append(empty, entry)
 			continue
 		}
 		canonical, err := canonicalGcid(entry)
@@ -93,7 +103,7 @@ func ParseDemoManaAllowedGcids(raw string) (map[string]struct{}, []string) {
 		}
 		allowed[canonical] = struct{}{}
 	}
-	return allowed, malformed
+	return allowed, malformed, empty
 }
 
 // canonicalGcid returns the canonical (lowercase, hyphenated) form of a GCID.
@@ -128,16 +138,93 @@ type DemoManaHandler struct {
 	users     identity.UserRepository
 	manaStore mana.Store
 	cfg       DemoManaConfig
+	// session validates the Chora session JWT that authenticates the caller.
+	// Endpoint-scoped: no other identity route is changed by it.
+	session *chorasession.Validator
 }
 
-// NewDemoManaHandler wires the demo mana grant handler.
-func NewDemoManaHandler(users identity.UserRepository, manaStore mana.Store, cfg DemoManaConfig) *DemoManaHandler {
-	return &DemoManaHandler{users: users, manaStore: manaStore, cfg: cfg}
+// NewDemoManaHandler wires the demo mana grant handler. session may be nil only
+// while the endpoint is disabled — an enabled endpoint without a session
+// validator is refused at boot (see demoSessionValidatorFromEnv), because a
+// demo grant that cannot authenticate its caller must not be served at all.
+func NewDemoManaHandler(
+	users identity.UserRepository,
+	manaStore mana.Store,
+	cfg DemoManaConfig,
+	session *chorasession.Validator,
+) *DemoManaHandler {
+	return &DemoManaHandler{users: users, manaStore: manaStore, cfg: cfg, session: session}
 }
 
 // RegisterRoutes mounts the demo grant route.
 func (h *DemoManaHandler) RegisterRoutes(mux *http.ServeMux) {
-	mux.Handle("/api/v1/me/mana/demo-grant", bearerAuth(h.users, http.HandlerFunc(h.demoGrant)))
+	mux.Handle("/api/v1/me/mana/demo-grant", h.requireSessionJWT(http.HandlerFunc(h.demoGrant)))
+}
+
+// demoSessionClaimsCtxKey carries the VALIDATED chorasession.Claims on the
+// request context. Distinct from ctxKeyGcid, which tenantContext fills from
+// unauthenticated headers — the two must never be conflated.
+type demoSessionClaimsCtxKey struct{}
+
+// demoSessionClaimsFromContext returns the validated session claims, or
+// (nil, false) when the request never passed requireSessionJWT.
+func demoSessionClaimsFromContext(ctx context.Context) (*chorasession.Claims, bool) {
+	c, ok := ctx.Value(demoSessionClaimsCtxKey{}).(*chorasession.Claims)
+	return c, ok && c != nil
+}
+
+// requireSessionJWT is the authentication boundary for the demo grant.
+//
+// It REPLACES bearerAuth for this one route. bearerAuth resolves the caller
+// from `chora-gcid` / `gcid` headers or a raw-GCID Bearer token and then only
+// checks that the GCID EXISTS in the user repository — existence checking, not
+// authentication. Any container on the Docker network that can name an
+// allowlisted GCID therefore obtained that account's authority over a free
+// mana grant.
+//
+// This middleware instead requires a Chora session JWT and verifies it with the
+// SAME chorasession.Validator chora-gateway uses at its /api/* trust boundary
+// (chora-common/auth/chorasession) — signature, issuer, audience, expiry and
+// the gcid claim. The GCID is then read from the VALIDATED claims, so:
+//
+//   - chora-gcid / gcid / X-Gcid / X-Chora-GCID and every other client-supplied
+//     GCID are ignored for authorization on this endpoint;
+//   - a raw-GCID Bearer token is not a JWT and fails validation (401);
+//   - an unverified payload is never compared against a header — the signature
+//     is verified BEFORE any claim is trusted.
+//
+// On any rejection it writes 401 + the canonical error envelope and
+// short-circuits. The specific validator error is logged, not returned, so the
+// response does not disclose which check failed.
+func (h *DemoManaHandler) requireSessionJWT(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.session == nil {
+			// Fail closed. Unreachable when the composition root honours the
+			// enabled-without-validator boot gate.
+			writeError(w, http.StatusUnauthorized, "DEMO_SESSION_UNAVAILABLE",
+				"demo mana grant session validation is not configured")
+			return
+		}
+		token, ok := extractBearer(r.Header.Get("Authorization"))
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "DEMO_SESSION_REQUIRED",
+				"Authorization: Bearer <Chora session JWT> is required")
+			return
+		}
+		claims, err := h.session.Validate(token)
+		if err != nil {
+			log.Printf("demoGrant: session rejected: %v", err)
+			writeError(w, http.StatusUnauthorized, "DEMO_SESSION_INVALID",
+				"a valid Chora session JWT is required")
+			return
+		}
+		if strings.TrimSpace(claims.GCID) == "" {
+			writeError(w, http.StatusUnauthorized, "DEMO_SESSION_INVALID",
+				"session JWT carries no gcid claim")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), demoSessionClaimsCtxKey{}, claims)))
+	})
 }
 
 // demoGrant applies one fixed demo mana grant to the authenticated caller.
@@ -155,10 +242,44 @@ func (h *DemoManaHandler) demoGrant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	// GCID comes ONLY from the validated server-side session context. Nothing
-	// in the request body, query string or headers is consulted for identity:
-	// the authenticated caller wins.
-	gcid := gcidFromContext(ctx)
+	// GCID comes ONLY from the VALIDATED session claims. Nothing in the request
+	// body, query string or headers is consulted for identity: the
+	// authenticated caller wins. gcidFromContext (tenantContext) is filled from
+	// unauthenticated headers and is deliberately NOT read here.
+	claims, ok := demoSessionClaimsFromContext(ctx)
+	if !ok {
+		// Defensive: requireSessionJWT always stamps the claims. Refuse loud
+		// rather than fall back to any other identity source.
+		writeError(w, http.StatusUnauthorized, "DEMO_SESSION_INVALID",
+			"a valid Chora session JWT is required")
+		return
+	}
+	gcid := claims.GCID
+
+	// TENANT CONSISTENCY. The session carries the caller's active tenant; the
+	// request's tenant context (X-Tenant-Id, which the gateway stamps from that
+	// same session) must agree with it. A mismatch means the request is
+	// assembled from a session and a tenant that do not belong together, so it
+	// is refused rather than honoured under whichever tenant the header names.
+	// When the request carries no tenant context there is nothing to be
+	// inconsistent with, so the check is not applicable.
+	if reqTenant := tenantFromContext(ctx); reqTenant != "" && reqTenant != claims.TenantID {
+		writeError(w, http.StatusUnauthorized, "DEMO_SESSION_TENANT_MISMATCH",
+			"session tenant does not match the request tenant context")
+		return
+	}
+
+	// Defence in depth: the JWT was minted for a real account, but an account
+	// closed or deleted after minting must not be able to claim free mana.
+	if _, err := h.users.GetByGcid(ctx, gcid); err != nil {
+		if errors.Is(err, identity.ErrUserNotFound) {
+			writeError(w, http.StatusUnauthorized, "IDENTITY_UNKNOWN_GCID", "unknown session gcid")
+			return
+		}
+		log.Printf("demoGrant: user lookup error: %v", err)
+		writeError(w, http.StatusInternalServerError, "IDENTITY_REPO_ERROR", "internal error")
+		return
+	}
 
 	// ALLOWLIST GATE — the demo grant is restricted to designated demo
 	// accounts. Identity is settled FIRST: a caller who is not on the list is

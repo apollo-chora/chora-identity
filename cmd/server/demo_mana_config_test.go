@@ -18,7 +18,8 @@ const (
 )
 
 // clearDemoManaEnv pins every demo-mana env var to empty so a spec sees only
-// what it sets itself.
+// what it sets itself. The session vars are included because they gate the
+// same endpoint's authentication boundary.
 func clearDemoManaEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
@@ -28,8 +29,102 @@ func clearDemoManaEnv(t *testing.T) {
 		"CHORA_DEMO_MANA_GRANT_UNITS",
 		"CHORA_DEMO_MANA_GRANT_MAX_PER_GCID",
 		"CHORA_DEMO_MANA_GRANT_TOTAL_BUDGET",
+		"CHORA_SESSION_SIGNER",
+		"CHORA_SESSION_ISSUER",
+		"CHORA_SESSION_AUDIENCE",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+// setSessionEnv pins the three Chora session vars the demo grant's
+// authentication boundary is configured from.
+func setSessionEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("CHORA_SESSION_SIGNER", "test-demo-session-signer-key-0123456789abcdef")
+	t.Setenv("CHORA_SESSION_ISSUER", "https://auth.chora.dev")
+	t.Setenv("CHORA_SESSION_AUDIENCE", "chora-identity")
+}
+
+// --- session validator boot gate ---------------------------------------------
+//
+// The demo grant is the one identity route that must not trust client-supplied
+// identity headers, so it is the one that requires a validated Chora session
+// JWT. An enabled endpoint with no session validator must fail the boot rather
+// than come up able to authenticate nobody.
+
+func TestDemoSessionValidatorFromEnv_NotConfiguredWhileDisabled(t *testing.T) {
+	clearDemoManaEnv(t)
+
+	v, err := demoSessionValidatorFromEnv(false)
+	if err != nil {
+		t.Fatalf("err = %v, want nil — a disabled endpoint needs no session validator", err)
+	}
+	if v != nil {
+		t.Error("validator != nil, want nil while the endpoint is disabled")
+	}
+}
+
+func TestDemoSessionValidatorFromEnv_EnabledWithoutSessionEnv_FailsStartup(t *testing.T) {
+	clearDemoManaEnv(t)
+
+	_, err := demoSessionValidatorFromEnv(true)
+	if err == nil {
+		t.Fatal("err = nil, want a startup failure — an enabled endpoint cannot authenticate callers without a session validator")
+	}
+	for _, want := range []string{"CHORA_SESSION_SIGNER", "CHORA_SESSION_ISSUER", "CHORA_SESSION_AUDIENCE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to name %s", err, want)
+		}
+	}
+}
+
+func TestDemoSessionValidatorFromEnv_EnabledWithPartialSessionEnv_FailsStartup(t *testing.T) {
+	// A half-configured session env is a misconfiguration, not a weaker one.
+	clearDemoManaEnv(t)
+	t.Setenv("CHORA_SESSION_SIGNER", "test-demo-session-signer-key-0123456789abcdef")
+
+	if _, err := demoSessionValidatorFromEnv(true); err == nil {
+		t.Fatal("err = nil, want a startup failure on a partially configured session env")
+	}
+}
+
+func TestDemoSessionValidatorFromEnv_EnabledWithSessionEnv_Builds(t *testing.T) {
+	clearDemoManaEnv(t)
+	setSessionEnv(t)
+
+	v, err := demoSessionValidatorFromEnv(true)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if v == nil {
+		t.Fatal("validator == nil, want a built validator")
+	}
+}
+
+func TestDemoSessionValidatorFromEnv_UndersizedSigner_FailsStartup(t *testing.T) {
+	clearDemoManaEnv(t)
+	t.Setenv("CHORA_SESSION_SIGNER", "too-short")
+	t.Setenv("CHORA_SESSION_ISSUER", "https://auth.chora.dev")
+	t.Setenv("CHORA_SESSION_AUDIENCE", "chora-identity")
+
+	// chorasession.NewValidator enforces the RFC 7518 §3.2 32-byte HS256
+	// minimum; an enabled demo grant must not boot with a weaker key.
+	if _, err := demoSessionValidatorFromEnv(true); err == nil {
+		t.Fatal("err = nil, want a startup failure on an undersized session signer")
+	}
+}
+
+func TestDemoSessionValidatorFromEnv_PartialSessionEnvWhileDisabled_DoesNotFail(t *testing.T) {
+	clearDemoManaEnv(t)
+	t.Setenv("CHORA_SESSION_SIGNER", "test-demo-session-signer-key-0123456789abcdef")
+
+	v, err := demoSessionValidatorFromEnv(false)
+	if err != nil {
+		t.Fatalf("err = %v, want nil while the endpoint is disabled", err)
+	}
+	if v != nil {
+		t.Error("validator != nil, want nil while the endpoint is disabled")
 	}
 }
 
@@ -110,9 +205,10 @@ func TestDemoManaConfigFromEnv_MalformedGcid_DisabledDoesNotFail(t *testing.T) {
 
 func TestDemoManaConfigFromEnv_EnabledWithAllowlist_OK(t *testing.T) {
 	clearDemoManaEnv(t)
-	// Canonicalised: uppercase entry, extra whitespace, trailing comma.
+	// Canonicalised: uppercase entry, extra whitespace, a blank slot BETWEEN
+	// entries is still rejected — see the empty-slot spec below.
 	t.Setenv("CHORA_DEMO_MANA_ALLOWED_GCIDS",
-		" "+strings.ToUpper(demoCfgGcidA)+" , "+demoCfgGcidB+", ")
+		" "+strings.ToUpper(demoCfgGcidA)+" , "+demoCfgGcidB)
 
 	cfg, err := demoManaConfigFromEnv("local", true, true)
 	if err != nil {
@@ -131,6 +227,46 @@ func TestDemoManaConfigFromEnv_EnabledWithAllowlist_OK(t *testing.T) {
 		if !cfg.AllowsGcid(want) {
 			t.Errorf("AllowsGcid(%s) = false, want true", want)
 		}
+	}
+}
+
+func TestDemoManaConfigFromEnv_EnabledWithEmptySlot_FailsStartup(t *testing.T) {
+	// A trailing comma (or any blank slot) is an allowlist the operator never
+	// wrote. Silently skipping it is how "gcid-a, gcid-b," becomes a
+	// two-account list, so an enabled endpoint must refuse to boot.
+	for _, bad := range []string{
+		demoCfgGcidA + ",",
+		"," + demoCfgGcidA,
+		demoCfgGcidA + ", ," + demoCfgGcidB,
+		demoCfgGcidA + ",\t,",
+	} {
+		t.Run(bad, func(t *testing.T) {
+			clearDemoManaEnv(t)
+			t.Setenv("CHORA_DEMO_MANA_ALLOWED_GCIDS", bad)
+
+			_, err := demoManaConfigFromEnv("local", true, true)
+			if err == nil {
+				t.Fatalf("err = nil, want a startup failure on the empty slot in %q", bad)
+			}
+			if !strings.Contains(err.Error(), "empty slot") {
+				t.Errorf("err = %v, want it to report the empty slot", err)
+			}
+		})
+	}
+}
+
+func TestDemoManaConfigFromEnv_EmptySlot_DisabledDoesNotFail(t *testing.T) {
+	// A stale allowlist value must not take down a deployment that does not
+	// expose the endpoint at all.
+	clearDemoManaEnv(t)
+	t.Setenv("CHORA_DEMO_MANA_ALLOWED_GCIDS", demoCfgGcidA+",")
+
+	cfg, err := demoManaConfigFromEnv("local", false, false)
+	if err != nil {
+		t.Fatalf("err = %v, want nil while the endpoint is disabled", err)
+	}
+	if cfg.Enabled {
+		t.Error("Enabled = true, want false")
 	}
 }
 

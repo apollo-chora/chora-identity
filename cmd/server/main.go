@@ -685,6 +685,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("identity: demo mana grant config: %v", err)
 	}
+	// The demo grant is the one identity route that must NOT trust client-
+	// supplied identity headers, so it is the one that requires a validated
+	// Chora session JWT. An enabled endpoint without a session validator fails
+	// the boot — see demoSessionValidatorFromEnv.
+	demoSession, err := demoSessionValidatorFromEnv(demoManaCfg.Enabled)
+	if err != nil {
+		log.Fatalf("identity: demo mana grant session validation: %v", err)
+	}
 	if demoManaCfg.Enabled {
 		log.Printf("identity: demo mana grant ENABLED (units=%d max_per_gcid=%d total_budget=%d allowed_gcids=%d)",
 			demoManaCfg.GrantUnits, demoManaCfg.MaxPerGcid, demoManaCfg.TotalBudgetUnits, len(demoManaCfg.AllowedGcids))
@@ -692,7 +700,7 @@ func main() {
 		log.Printf("identity: demo mana grant disabled (CHORA_DEMO_MODE=%t CHORA_DEMO_MANA_TOPUP_ENABLED=%t CHORA_ENV=%s)",
 			demoModeOn, demoTopupOn, choraEnv)
 	}
-	httpadapter.NewDemoManaHandler(routerUsers, manaStore, demoManaCfg).RegisterRoutes(economyMux)
+	httpadapter.NewDemoManaHandler(routerUsers, manaStore, demoManaCfg, demoSession).RegisterRoutes(economyMux)
 
 	// SP2.9 — GCID-scoped UI preferences (A+ dashboard-as-hub layout) on the
 	// User profile aggregate (users.ui_preferences JSONB, migration 0034).

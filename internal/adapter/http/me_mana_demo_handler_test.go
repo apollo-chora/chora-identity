@@ -4,12 +4,17 @@ package httpadapter_test
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/apollo-chora/chora-common/auth/chorasession"
 	httpadapter "github.com/apollo-chora/chora-identity/internal/adapter/http"
 	"github.com/apollo-chora/chora-identity/internal/adapter/inmem"
 	"github.com/apollo-chora/chora-identity/internal/adapter/repo"
@@ -68,7 +73,7 @@ func demoServer(t *testing.T, users identity.UserRepository, cfg httpadapter.Dem
 	t.Helper()
 	store := repo.NewInMemManaStore()
 	mux := http.NewServeMux()
-	httpadapter.NewDemoManaHandler(users, store, cfg).RegisterRoutes(mux)
+	httpadapter.NewDemoManaHandler(users, store, cfg, demoSessionValidator(t)).RegisterRoutes(mux)
 	return mux, store
 }
 
@@ -76,8 +81,8 @@ func demoServer(t *testing.T, users identity.UserRepository, cfg httpadapter.Dem
 // into DemoManaConfig from CHORA_DEMO_MANA_ALLOWED_GCIDS. The inputs are test
 // constants, so a malformed one is a bug in the spec, not a scenario.
 func demoAllowlist(gcids ...string) map[string]struct{} {
-	set, malformed := httpadapter.ParseDemoManaAllowedGcids(strings.Join(gcids, ","))
-	if len(malformed) > 0 {
+	set, malformed, empty := httpadapter.ParseDemoManaAllowedGcids(strings.Join(gcids, ","))
+	if len(malformed) > 0 || len(empty) > 0 {
 		panic("test gcids must be valid UUIDs: " + strings.Join(malformed, ","))
 	}
 	return set
@@ -96,13 +101,17 @@ func demoEnabled(units int64) httpadapter.DemoManaConfig {
 	}
 }
 
-func demoPost(gcid, key string, body string) *http.Request {
+// demoPost builds a demo-grant request authenticated by a VALID Chora session
+// JWT for gcid. The bearer is a JWT, never a raw GCID — the endpoint rejects
+// the legacy bearer-as-gcid shape.
+func demoPost(t *testing.T, gcid, key string, body string) *http.Request {
+	t.Helper()
 	var buf bytes.Buffer
 	if body != "" {
 		_, _ = buf.WriteString(body)
 	}
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/me/mana/demo-grant", &buf)
-	r.Header.Set("Authorization", "Bearer "+gcid)
+	r.Header.Set("Authorization", "Bearer "+demoValidSessionJWT(t, gcid, demoTenantID))
 	r.Header.Set("Content-Type", "application/json")
 	if key != "" {
 		r.Header.Set("Idempotency-Key", key)
@@ -132,7 +141,7 @@ func TestDemoGrant_FlagOff_Returns404(t *testing.T) {
 	// The zero value of DemoManaConfig is disabled — default OFF.
 	h, store := newDemoServer(t, httpadapter.DemoManaConfig{}, demoGcidA)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-1", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-1", ""))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -147,7 +156,7 @@ func TestDemoGrant_FlagOff_Returns404(t *testing.T) {
 func TestDemoGrant_MissingIdempotencyKey_Returns400(t *testing.T) {
 	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "", ""))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -162,7 +171,7 @@ func TestDemoGrant_MissingIdempotencyKey_Returns400(t *testing.T) {
 func TestDemoGrant_Success_ReturnsGrantShape(t *testing.T) {
 	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-ok", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-ok", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -200,7 +209,7 @@ func TestDemoGrant_SameIdempotencyKey_GrantsExactlyOnce(t *testing.T) {
 	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
 
 	for i := 0; i < 5; i++ {
-		rec := doDemo(t, h, demoPost(demoGcidA, "k-replay", ""))
+		rec := doDemo(t, h, demoPost(t, demoGcidA, "k-replay", ""))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("attempt %d: status = %d, want 200 (body=%s)", i, rec.Code, rec.Body.String())
 		}
@@ -226,12 +235,12 @@ func TestDemoGrant_ReportedBalanceReflectsSpending(t *testing.T) {
 	// CURRENT balance, never top it back up.
 	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
 
-	if rec := doDemo(t, h, demoPost(demoGcidA, "k-1", "")); rec.Code != http.StatusOK {
+	if rec := doDemo(t, h, demoPost(t, demoGcidA, "k-1", "")); rec.Code != http.StatusOK {
 		t.Fatalf("first: status = %d", rec.Code)
 	}
 	spend(t, store, demoGcidA, 400_000)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-1", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-1", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("replay: status = %d", rec.Code)
 	}
@@ -252,7 +261,7 @@ func TestDemoGrant_WrongGcid_CannotCreditAnotherAccount(t *testing.T) {
 	// be able to credit a different account by naming it in the body or query.
 	h, store := newDemoServer(t, demoEnabled(1_000_000), demoGcidA, demoGcidB)
 
-	req := demoPost(demoGcidA, "k-target", `{"gcid":"`+demoGcidB+`","units":999999}`)
+	req := demoPost(t, demoGcidA, "k-target", `{"gcid":"`+demoGcidB+`","units":999999}`)
 	req.URL.RawQuery = "gcid=" + demoGcidB
 	rec := doDemo(t, h, req)
 	if rec.Code != http.StatusOK {
@@ -276,12 +285,12 @@ func TestDemoGrant_PerGcidCap_Returns429(t *testing.T) {
 	h, store := newDemoServer(t, cfg, demoGcidA)
 
 	for i := 1; i <= 2; i++ {
-		rec := doDemo(t, h, demoPost(demoGcidA, "k-cap-"+strings.Repeat("x", i), ""))
+		rec := doDemo(t, h, demoPost(t, demoGcidA, "k-cap-"+strings.Repeat("x", i), ""))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("grant %d: status = %d, want 200", i, rec.Code)
 		}
 	}
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-cap-3", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-cap-3", ""))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -301,13 +310,13 @@ func TestDemoGrant_TotalBudget_Returns429(t *testing.T) {
 
 	// Two full grants from A consume 2,000,000 of the 2,500,000 budget.
 	for i, k := range []string{"k-b1", "k-b2"} {
-		rec := doDemo(t, h, demoPost(demoGcidA, k, ""))
+		rec := doDemo(t, h, demoPost(t, demoGcidA, k, ""))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("A grant %d: status = %d, want 200", i, rec.Code)
 		}
 	}
 	// A third would push the total to 3,000,000 > 2,500,000.
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-b3", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-b3", ""))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -329,7 +338,7 @@ func TestDemoGrant_ConcurrentSameKey_GrantsExactlyOnce(t *testing.T) {
 		go func(i int) {
 			defer func() { done <- struct{}{} }()
 			recs[i] = httptest.NewRecorder()
-			h.ServeHTTP(recs[i], demoPost(demoGcidA, "k-race", ""))
+			h.ServeHTTP(recs[i], demoPost(t, demoGcidA, "k-race", ""))
 		}(i)
 	}
 	for range workers {
@@ -361,7 +370,9 @@ func TestDemoGrant_ConcurrentSameKey_GrantsExactlyOnce(t *testing.T) {
 func TestDemoGrant_GetMethod_Returns405(t *testing.T) {
 	h, _ := newDemoServer(t, demoEnabled(1_000_000), demoGcidA)
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/me/mana/demo-grant", nil)
-	r.Header.Set("Authorization", "Bearer "+demoGcidA)
+	// Authenticated: the 405 is a METHOD decision, so the request must first
+	// clear the session boundary.
+	r.Header.Set("Authorization", "Bearer "+demoValidSessionJWT(t, demoGcidA, demoTenantID))
 	rec := doDemo(t, h, r)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
@@ -381,7 +392,7 @@ func TestDemoGrant_ReusedKeyWithDifferentPayload_Returns409(t *testing.T) {
 		t.Fatalf("seed the conflicting entry: %v", err)
 	}
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-conflict", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-conflict", ""))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -401,15 +412,15 @@ func TestDemoGrant_ReplayAfterCapReached_StillReturns200(t *testing.T) {
 	cfg.MaxPerGcid = 1
 	h, store := newDemoServer(t, cfg, demoGcidA)
 
-	if rec := doDemo(t, h, demoPost(demoGcidA, "k-first", "")); rec.Code != http.StatusOK {
+	if rec := doDemo(t, h, demoPost(t, demoGcidA, "k-first", "")); rec.Code != http.StatusOK {
 		t.Fatalf("first grant: status = %d", rec.Code)
 	}
 	// The cap is now exhausted for a NEW key...
-	if rec := doDemo(t, h, demoPost(demoGcidA, "k-second", "")); rec.Code != http.StatusTooManyRequests {
+	if rec := doDemo(t, h, demoPost(t, demoGcidA, "k-second", "")); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("new key: status = %d, want 429", rec.Code)
 	}
 	// ...but replaying the granted key still succeeds.
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-first", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-first", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("replay: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -428,7 +439,7 @@ func TestDemoGrant_AllowlistedGcid_Grants(t *testing.T) {
 	cfg.AllowedGcids = demoAllowlist(demoGcidA)
 	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-allowed", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-allowed", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -442,7 +453,7 @@ func TestDemoGrant_NonAllowlistedGcid_Returns403(t *testing.T) {
 	cfg.AllowedGcids = demoAllowlist(demoGcidA)
 	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
 
-	rec := doDemo(t, h, demoPost(demoGcidB, "k-denied", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidB, "k-denied", ""))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -471,7 +482,7 @@ func TestDemoGrant_NonAllowlistedGcid_Returns403(t *testing.T) {
 
 	// Identity is settled before the request shape: a denied account gets 403
 	// even when it also omits the required Idempotency-Key.
-	rec = doDemo(t, h, demoPost(demoGcidB, "", ""))
+	rec = doDemo(t, h, demoPost(t, demoGcidB, "", ""))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("no idempotency key: status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -493,7 +504,7 @@ func TestDemoGrant_EmptyAllowlist_DeniesEveryone(t *testing.T) {
 			cfg.AllowedGcids = set
 			h, store := newDemoServer(t, cfg, demoGcidA)
 
-			rec := doDemo(t, h, demoPost(demoGcidA, "k-empty", ""))
+			rec := doDemo(t, h, demoPost(t, demoGcidA, "k-empty", ""))
 			if rec.Code != http.StatusForbidden {
 				t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
 			}
@@ -514,7 +525,7 @@ func TestDemoGrant_DisabledWithAllowlist_NoGrant(t *testing.T) {
 	cfg.AllowedGcids = demoAllowlist(demoGcidA)
 	h, store := newDemoServer(t, cfg, demoGcidA)
 
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-off", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-off", ""))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -535,12 +546,12 @@ func TestDemoGrant_SameEmailDifferentGcid_Denied(t *testing.T) {
 	h, store := newDemoServerSameEmail(t, cfg, sharedEmail, demoGcidA, demoGcidB)
 
 	// Sanity: both accounts really do share the email.
-	rec := doDemo(t, h, demoPost(demoGcidA, "k-shared-a", ""))
+	rec := doDemo(t, h, demoPost(t, demoGcidA, "k-shared-a", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("allowlisted account: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
 
-	rec = doDemo(t, h, demoPost(demoGcidB, "k-shared-b", ""))
+	rec = doDemo(t, h, demoPost(t, demoGcidB, "k-shared-b", ""))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("same-email other GCID: status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -560,7 +571,7 @@ func TestDemoGrant_SpoofedGcidInBodyAndHeader_Ignored(t *testing.T) {
 	cfg.AllowedGcids = demoAllowlist(demoGcidA)
 	h, store := newDemoServer(t, cfg, demoGcidA, demoGcidB)
 
-	req := demoPost(demoGcidB, "k-spoof", `{"gcid":"`+demoGcidA+`","units":999999999}`)
+	req := demoPost(t, demoGcidB, "k-spoof", `{"gcid":"`+demoGcidA+`","units":999999999}`)
 	req.URL.RawQuery = "gcid=" + demoGcidA
 	// Neither header is read by the auth path (the trusted mesh header is
 	// `chora-gcid`, stamped by the gateway) — they must not reach the check.
@@ -587,9 +598,9 @@ func TestDemoGrant_AllowlistCanonicalisesGcid(t *testing.T) {
 	// allowlist entry still matches the canonical GCID from the context.
 	const upper = "01970000-0000-7000-8000-00000000DA01"
 	for _, entry := range []string{upper, strings.ReplaceAll(demoGcidA, "-", "")} {
-		set, malformed := httpadapter.ParseDemoManaAllowedGcids(" " + entry + " ")
-		if len(malformed) != 0 {
-			t.Fatalf("ParseDemoManaAllowedGcids(%q) malformed = %v, want none", entry, malformed)
+		set, malformed, empty := httpadapter.ParseDemoManaAllowedGcids(" " + entry + " ")
+		if len(malformed) != 0 || len(empty) != 0 {
+			t.Fatalf("ParseDemoManaAllowedGcids(%q) malformed = %v empty = %v, want none", entry, malformed, empty)
 		}
 		if _, ok := set[demoGcidA]; !ok {
 			t.Errorf("set from %q = %v, want the canonical key %s", entry, set, demoGcidA)
@@ -597,13 +608,54 @@ func TestDemoGrant_AllowlistCanonicalisesGcid(t *testing.T) {
 		cfg := demoEnabled(1_000_000)
 		cfg.AllowedGcids = set
 		h, store := newDemoServer(t, cfg, demoGcidA)
-		rec := doDemo(t, h, demoPost(demoGcidA, "k-canon", ""))
+		rec := doDemo(t, h, demoPost(t, demoGcidA, "k-canon", ""))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("entry %q: status = %d, want 200 (body=%s)", entry, rec.Code, rec.Body.String())
 		}
 		if got := mustBalance(t, store, demoGcidA); got != 1_000_000 {
 			t.Errorf("balance = %d, want 1000000", got)
 		}
+	}
+}
+
+// --- allowlist parser: empty comma-separated slots are rejected -------------
+
+func TestDemoGrant_AllowlistParser_RejectsEmptySlots(t *testing.T) {
+	// A trailing comma or a blank slot between entries used to be silently
+	// skipped, so "gcid-a, gcid-b," became a two-account list the operator
+	// never wrote. The parser must surface the empty slot instead.
+	cases := []struct {
+		name       string
+		raw        string
+		wantEmpty  int
+		wantMalformed int
+	}{
+		{"clean list", demoGcidA + "," + demoGcidB, 0, 0},
+		{"trailing comma", demoGcidA + ",", 1, 0},
+		{"leading comma", "," + demoGcidA, 1, 0},
+		{"blank slot between", demoGcidA + ", ," + demoGcidB, 1, 0},
+		{"whitespace-only slot", demoGcidA + ",\t," + demoGcidB, 1, 0},
+		{"only slots", " , ,, ", 4, 0},
+		{"malformed still reported", demoGcidA + ",not-a-uuid,", 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set, malformed, empty := httpadapter.ParseDemoManaAllowedGcids(tc.raw)
+			if len(empty) != tc.wantEmpty {
+				t.Errorf("ParseDemoManaAllowedGcids(%q) empty = %v, want %d slot(s)", tc.raw, empty, tc.wantEmpty)
+			}
+			if len(malformed) != tc.wantMalformed {
+				t.Errorf("ParseDemoManaAllowedGcids(%q) malformed = %v, want %d", tc.raw, malformed, tc.wantMalformed)
+			}
+			if tc.name == "clean list" {
+				if _, ok := set[demoGcidA]; !ok {
+					t.Errorf("set = %v, want %s", set, demoGcidA)
+				}
+				if _, ok := set[demoGcidB]; !ok {
+					t.Errorf("set = %v, want %s", set, demoGcidB)
+				}
+			}
+		})
 	}
 }
 
@@ -628,6 +680,63 @@ func TestDemoManaConfig_AllowsGcid_FailsClosed(t *testing.T) {
 	if (httpadapter.DemoManaConfig{}).AllowsGcid(demoGcidA) {
 		t.Error("zero config allows a GCID — the allowlist must fail closed")
 	}
+}
+
+// --- Chora session JWT fixtures ----------------------------------------------
+//
+// The demo grant authenticates callers with the SAME chorasession.Validator
+// chora-gateway uses at its /api/* trust boundary. These helpers mint real
+// HS256 JWTs against that validator's test key, so the specs exercise the
+// actual validation path (signature + issuer + audience + expiry + gcid
+// claim) rather than a stub.
+
+const (
+	demoSessionSigner   = "test-demo-session-signer-key-0123456789abcdef"
+	demoSessionIssuer   = "https://auth.chora.dev"
+	demoSessionAudience = "chora-identity"
+	demoTenantID        = "01970000-0000-7000-8000-0000000000aa"
+)
+
+func demoSessionValidator(t *testing.T) *chorasession.Validator {
+	t.Helper()
+	v, err := chorasession.NewValidator([]byte(demoSessionSigner), demoSessionIssuer, demoSessionAudience)
+	if err != nil {
+		t.Fatalf("NewValidator: %v", err)
+	}
+	return v
+}
+
+// demoSessionJWT mints a Chora session JWT over the supplied claims. The claims
+// map holds only strings and JSON numbers, so the marshal cannot fail; a panic
+// here would mean the spec itself is malformed.
+func demoSessionJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payloadJSON, err := json.Marshal(claims)
+	if err != nil {
+		panic("demoSessionJWT: " + err.Error())
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	mac := hmac.New(sha256.New, []byte(demoSessionSigner))
+	mac.Write([]byte(header + "." + payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return header + "." + payload + "." + sig
+}
+
+// demoValidSessionJWT mints a well-formed, unexpired session JWT for gcid.
+func demoValidSessionJWT(t *testing.T, gcid, tenantID string) string {
+	t.Helper()
+	now := time.Now().Unix()
+	return demoSessionJWT(t, map[string]any{
+		"iss":       demoSessionIssuer,
+		"aud":       demoSessionAudience,
+		"sub":       gcid,
+		"gcid":      gcid,
+		"tenant_id": tenantID,
+		"email":     gcid + "@chora.dev",
+		"iat":       now - 60,
+		"exp":       now + 3600,
+	})
 }
 
 // --- helpers -----------------------------------------------------------------
