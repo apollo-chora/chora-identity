@@ -198,6 +198,17 @@ func demoSessionClaimsFromContext(ctx context.Context) (*chorasession.Claims, bo
 // response does not disclose which check failed.
 func (h *DemoManaHandler) requireSessionJWT(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Enabled check FIRST, before authentication. A disabled demo must read
+		// as 404 DEMO_UNAVAILABLE (learner-economy.yaml grantDemoManaToSelf — an
+		// unavailable demo is not a permission the caller could ever be
+		// granted). Checking the session first made a DISABLED deployment answer
+		// 401 DEMO_SESSION_UNAVAILABLE, because the composition root builds no
+		// validator when the feature is off.
+		if !h.cfg.Enabled {
+			writeError(w, http.StatusNotFound, "DEMO_UNAVAILABLE",
+				"demo mana grant is not available (set CHORA_DEMO_MANA_TOPUP_ENABLED=true and CHORA_DEMO_MODE=true, and never in prod)")
+			return
+		}
 		if h.session == nil {
 			// Fail closed. Unreachable when the composition root honours the
 			// enabled-without-validator boot gate.
