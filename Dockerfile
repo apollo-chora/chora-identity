@@ -47,6 +47,11 @@ RUN go build -trimpath -ldflags "-s -w" -o /out/service ./cmd/server
 # local admin (idempotent; driven by CHORA_SEED_* env).
 RUN go build -trimpath -ldflags "-s -w" -o /out/seed ./cmd/seed
 
+# The one-off demo mana seed grant ships too: the deployment host has no Go
+# toolchain, so an operator applies the demo balance with
+#   docker compose run --rm --entrypoint /seed-demo-mana identity -gcids=... -dry-run
+RUN go build -trimpath -ldflags "-s -w" -o /out/seed-demo-mana ./cmd/seed-demo-mana
+
 ############################
 # Stage 2 — runtime
 ############################
@@ -70,6 +75,7 @@ WORKDIR /
 
 COPY --from=builder /out/service /service
 COPY --from=builder /out/seed /seed
+COPY --from=builder /out/seed-demo-mana /seed-demo-mana
 
 # The federated closure-saga subscriber loads this PII map at the default
 # relative path config/PII_Closure_Map.yaml (runtime WORKDIR is /). Without

@@ -47,6 +47,32 @@ The seed job is idempotent. It upserts the tenant, user, local Argon2id credenti
 
 Two more users can be seeded alongside the admin: set `CHORA_SEED_INSTRUCTOR_USERNAME` (role `instructor`) and/or `CHORA_SEED_STUDENT_USERNAME` — the matching `_EMAIL` and `_PASSWORD` variables then become required. The student account is stored with membership_role `learner`; the stored role vocabulary has no `student` value. PLATFORM_OPERATOR is intentionally not seedable here (ADR-165: cross-tenant role with no membership row).
 
+### One-off demo mana seed grant
+
+`cmd/seed-demo-mana` credits the demo mana balance (default `1000000000`) to an explicit list of **existing** GCIDs. It exists because the full seed job above also upserts the tenant, user rows, credentials and memberships, so running it on a live deployment merely to add balances can mutate identity data. This command writes only `user_mana` + `mana_ledger`, through the same transactional primitive `cmd/seed` uses. A GCID with no `users` row is reported as `unknown-gcid` and **not** created.
+
+It is idempotent: the idempotency key is deterministic (`demo-seed:v1:<gcid>`), so a re-run replays and credits nothing, and a balance the account has since spent is never reset. Each GCID is granted in its own transaction with `SET LOCAL chora.user_gcid` applied, so the wallet/ledger RLS policy scopes the write to that account.
+
+Both modes refuse to run unless `CHORA_DEMO_MANA_TOPUP_ENABLED=true` and `CHORA_DEMO_MODE=true`, and refuse outright when `CHORA_ENV` is `prod` or `production`.
+
+```sh
+# Dry run — reads the wallet and ledger state and reports what WOULD happen; writes nothing.
+CHORA_ENV=local \
+CHORA_DEMO_MODE=true \
+CHORA_DEMO_MANA_TOPUP_ENABLED=true \
+CHORA_DB_DSN='postgres://chora_identity_app_rw:...@localhost:5432/chora_identity?sslmode=disable' \
+go run ./cmd/seed-demo-mana -gcids=<gcid>,<gcid> -dry-run
+
+# Real run — the same invocation without -dry-run.
+CHORA_ENV=local \
+CHORA_DEMO_MODE=true \
+CHORA_DEMO_MANA_TOPUP_ENABLED=true \
+CHORA_DB_DSN='postgres://chora_identity_app_rw:...@localhost:5432/chora_identity?sslmode=disable' \
+go run ./cmd/seed-demo-mana -gcids=<gcid>,<gcid>
+```
+
+GCIDs may also be given as repeated `-gcid=<gcid>` flags or as `CHORA_DEMO_MANA_GCIDS`; the amount via `-amount` or `CHORA_DEMO_MANA_GRANT_UNITS`. Every run prints an audit line per GCID (`applied` / `replayed` / `unknown-gcid` / `would-apply` / `would-replay` / `conflict`) and a batch summary. The exit status is non-zero when any GCID was not granted.
+
 ## Usage
 
 ### Health and readiness
@@ -172,6 +198,7 @@ Build the server and seed binaries directly with Go:
 ```sh
 go build ./cmd/server
 go build ./cmd/seed
+go build ./cmd/seed-demo-mana
 ```
 
 Run the test suite:
@@ -186,14 +213,15 @@ Build the production container from the repository root:
 docker build -t chora-identity:local .
 ```
 
-The Dockerfile builds both `./cmd/server` and `./cmd/seed` and produces a small Alpine-based runtime image.
+The Dockerfile builds `./cmd/server`, `./cmd/seed` and `./cmd/seed-demo-mana` and produces a small Alpine-based runtime image.
 
 ### Project layout
 
 ```text
 cmd/
-  server/       service entrypoint and composition root
-  seed/         idempotent local-admin provisioning job
+  server/        service entrypoint and composition root
+  seed/          idempotent local-admin provisioning job
+  seed-demo-mana/ one-off demo mana seed grant for explicit existing GCIDs
 
 internal/
   adapter/      HTTP, gRPC, PostgreSQL, event, crypto, and integration adapters
