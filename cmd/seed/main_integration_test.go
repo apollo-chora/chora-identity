@@ -143,7 +143,7 @@ func TestIntegration_SeedDemoGrant_CreditsWalletAndLedger(t *testing.T) {
 		Username: "demoit-" + uuid.NewString()[:8],
 		Email:    "demoit-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
-		Role:     identity.RoleAdmin,
+		Roles:    []identity.Role{identity.RoleAdmin},
 	}
 	gcid := seedGcid(authn.NormalizeUsername(u.Username))
 
@@ -179,7 +179,7 @@ func TestIntegration_SeedDemoGrant_RerunAddsNothing(t *testing.T) {
 		Username: "demoit-" + uuid.NewString()[:8],
 		Email:    "demoit2-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
-		Role:     identity.RoleLearner,
+		Roles:    []identity.Role{identity.RoleLearner},
 	}
 	gcid := seedGcid(authn.NormalizeUsername(u.Username))
 
@@ -215,7 +215,7 @@ func TestIntegration_SeedDemoGrant_AfterSpendingPreservesSpentBalance(t *testing
 		Username: "demoit-" + uuid.NewString()[:8],
 		Email:    "demoit3-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
-		Role:     identity.RoleInstructor,
+		Roles:    []identity.Role{identity.RoleInstructor},
 	}
 	gcid := seedGcid(authn.NormalizeUsername(u.Username))
 
@@ -261,7 +261,7 @@ func TestIntegration_SeedDemoGrant_TransactionFailureChangesNeither(t *testing.T
 		Username: "demoit-" + uuid.NewString()[:8],
 		Email:    "demoit4-" + uuid.NewString()[:8] + "@example.com",
 		Password: "hunter2",
-		Role:     identity.RoleAdmin,
+		Roles:    []identity.Role{identity.RoleAdmin},
 	}
 	gcid := seedGcid(authn.NormalizeUsername(u.Username))
 
