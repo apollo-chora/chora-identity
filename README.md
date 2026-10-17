@@ -45,7 +45,9 @@ go run ./cmd/seed
 
 The seed job is idempotent. It upserts the tenant, user, local Argon2id credential, and active admin membership in one transaction.
 
-Two more users can be seeded alongside the admin: set `CHORA_SEED_INSTRUCTOR_USERNAME` (role `instructor`) and/or `CHORA_SEED_STUDENT_USERNAME` — the matching `_EMAIL` and `_PASSWORD` variables then become required. The student account is stored with membership_role `learner`; the stored role vocabulary has no `student` value. PLATFORM_OPERATOR is intentionally not seedable here (ADR-165: cross-tenant role with no membership row).
+Two more users can be seeded alongside the admin: set `CHORA_SEED_INSTRUCTOR_USERNAME` (roles `instructor` + `author` — only `author` maps to the `aplus` surface that gates A+ authoring, and the demo instructor authors atoms) and/or `CHORA_SEED_STUDENT_USERNAME` — the matching `_EMAIL` and `_PASSWORD` variables then become required. The student account is stored with membership_role `learner`; the stored role vocabulary has no `student` value. PLATFORM_OPERATOR is intentionally not seedable here (ADR-165: cross-tenant role with no membership row).
+
+After the identity transaction commits, the seed upserts every seeded membership into chora-tenancy (the authoritative store) over gRPC when `SVC_TENANCY_GRPC_URL` is set; without it the seed logs a warning and provisions only the identity-local mirror, so minted sessions carry `surfaces: null`.
 
 ### One-off demo mana seed grant
 

@@ -9,6 +9,7 @@ import (
 
 	pg "github.com/apollo-chora/chora-identity/internal/adapter/pg"
 
+	"github.com/apollo-chora/chora-identity/internal/domain/authn"
 	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
 )
 
@@ -173,8 +174,8 @@ func TestSeedUsers_AdminOnlyByDefault(t *testing.T) {
 	if len(users) != 1 {
 		t.Fatalf("want 1 seed user (admin), got %d", len(users))
 	}
-	if users[0].Role != "admin" {
-		t.Errorf("admin role = %q", users[0].Role)
+	if len(users[0].Roles) != 1 || users[0].Roles[0] != "admin" {
+		t.Errorf("admin roles = %v, want [admin]", users[0].Roles)
 	}
 }
 
@@ -197,15 +198,19 @@ func TestSeedUsers_InstructorAndStudent(t *testing.T) {
 	if len(users) != 3 {
 		t.Fatalf("want 3 seed users, got %d", len(users))
 	}
-	if users[0].Username != "Admin" || users[0].Role != "admin" {
-		t.Errorf("users[0] = %q role %q, want Admin/admin", users[0].Username, users[0].Role)
+	if users[0].Username != "Admin" || len(users[0].Roles) != 1 || users[0].Roles[0] != "admin" {
+		t.Errorf("users[0] = %q roles %v, want Admin/[admin]", users[0].Username, users[0].Roles)
 	}
-	if users[1].Username != "instructor" || users[1].Role != "instructor" {
-		t.Errorf("users[1] = %q role %q, want instructor/instructor", users[1].Username, users[1].Role)
+	// The instructor carries instructor AND author: the demo instructor authors
+	// atoms, and only `author` maps to the `aplus` surface that gates A+
+	// authoring (see seedUsers).
+	if users[1].Username != "instructor" || len(users[1].Roles) != 2 ||
+		users[1].Roles[0] != "instructor" || users[1].Roles[1] != "author" {
+		t.Errorf("users[1] = %q roles %v, want instructor/[instructor author]", users[1].Username, users[1].Roles)
 	}
 	// The student account maps to the stored `learner` membership_role.
-	if users[2].Username != "student" || users[2].Role != "learner" {
-		t.Errorf("users[2] = %q role %q, want student/learner", users[2].Username, users[2].Role)
+	if users[2].Username != "student" || len(users[2].Roles) != 1 || users[2].Roles[0] != "learner" {
+		t.Errorf("users[2] = %q roles %v, want student/[learner]", users[2].Username, users[2].Roles)
 	}
 }
 
@@ -220,6 +225,108 @@ func TestSeedUsers_RejectsDuplicateUsername(t *testing.T) {
 	}
 	if _, err := seedUsers(cfg); err == nil {
 		t.Fatal("duplicate seed username must be rejected")
+	}
+}
+
+// --- tenancy membership provisioning ----------------------------------------
+
+// fakeTenancyUpserter records UpsertMembershipByTenantID calls and fails them
+// when failErr is set. It implements the seed's tenancyMembershipUpserter port
+// without dialing a real chora-tenancy server.
+type fakeTenancyUpserter struct {
+	calls   []fakeUpsertCall
+	failErr error
+}
+
+type fakeUpsertCall struct {
+	gcid     string
+	tenantID string
+	roles    []string
+}
+
+func (f *fakeTenancyUpserter) UpsertMembershipByTenantID(_ context.Context, gcid, tenantID string, roles []string) (bool, error) {
+	f.calls = append(f.calls, fakeUpsertCall{
+		gcid: gcid, tenantID: tenantID, roles: append([]string(nil), roles...),
+	})
+	if f.failErr != nil {
+		return false, f.failErr
+	}
+	return true, nil
+}
+
+func TestProvisionTenancyMemberships_UpsertsOncePerGcidTenantRole(t *testing.T) {
+	setAdminEnv(t)
+	t.Setenv("CHORA_SEED_INSTRUCTOR_USERNAME", "instructor")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_EMAIL", "instructor@example.com")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_PASSWORD", "hunter2")
+	t.Setenv("CHORA_SEED_STUDENT_USERNAME", "student")
+	t.Setenv("CHORA_SEED_STUDENT_EMAIL", "student@example.com")
+	t.Setenv("CHORA_SEED_STUDENT_PASSWORD", "hunter2")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	fake := &fakeTenancyUpserter{}
+	if err := provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users); err != nil {
+		t.Fatalf("provisionTenancyMemberships: %v", err)
+	}
+
+	// One additive upsert per (gcid, tenant, role): admin, instructor's two
+	// roles, student — four calls for the full roster.
+	if len(fake.calls) != 4 {
+		t.Fatalf("upsert calls = %d, want 4: %+v", len(fake.calls), fake.calls)
+	}
+	type key struct{ gcid, tenant, role string }
+	got := map[key]int{}
+	for _, c := range fake.calls {
+		if c.tenantID != cfg.TenantID {
+			t.Errorf("call tenant = %q, want %q", c.tenantID, cfg.TenantID)
+		}
+		if len(c.roles) != 1 {
+			t.Errorf("call roles = %v, want exactly one role per call", c.roles)
+			continue
+		}
+		got[key{c.gcid, c.tenantID, c.roles[0]}]++
+	}
+	for _, w := range []struct{ user, role string }{
+		{"Admin", "admin"},
+		{"instructor", "instructor"},
+		{"instructor", "author"},
+		{"student", "learner"},
+	} {
+		g := seedGcid(authn.NormalizeUsername(w.user))
+		if got[key{g, cfg.TenantID, w.role}] != 1 {
+			t.Errorf("upsert (%s, %s, %s) called %d times, want exactly 1", w.user, cfg.TenantID, w.role, got[key{g, cfg.TenantID, w.role}])
+		}
+	}
+}
+
+func TestProvisionTenancyMemberships_UpsertErrorFails(t *testing.T) {
+	setAdminEnv(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	fake := &fakeTenancyUpserter{failErr: errors.New("tenancy unavailable")}
+	err = provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users)
+	if err == nil {
+		t.Fatal("provisionTenancyMemberships err = nil, want the upsert failure to fail the run")
+	}
+	if !strings.Contains(err.Error(), "tenancy membership upsert") || !strings.Contains(err.Error(), "admin") {
+		t.Errorf("error = %v, want it to name the failing role", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Errorf("calls after failure = %d, want 1 (fail fast on the first error)", len(fake.calls))
 	}
 }
 
