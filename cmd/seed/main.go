@@ -17,7 +17,16 @@
 // surfaces: null. When SVC_TENANCY_GRPC_URL is unset the job logs a warning
 // and provisions the identity mirror only (dev mode); when it is set but the
 // dial or an upsert fails, the job exits non-zero rather than silently
-// provisioning a mirror the sessions cannot use.
+// provisioning a mirror the sessions cannot use. The one softening is a
+// bounded startup-race retry: TRANSIENT upsert failures (gRPC
+// Unavailable/DeadlineExceeded and connection-refused transport errors — in
+// Compose identity-seed can start before chora-tenancy's gRPC server accepts
+// connections, and grpcconn.Dial's eager Connect() does not prove readiness)
+// are retried a hardcoded number of times with a short backoff. The bound is
+// deliberately NOT env-tunable: the retry window is a property of the deploy
+// race, not of the seeded data, and the seed context already bounds the whole
+// job. Permanent failures fail the upsert immediately; a tenancy still
+// unavailable after the bound fails the job non-zero.
 //
 // Seed users:
 //
@@ -25,9 +34,10 @@
 //	instructor — seeded when CHORA_SEED_INSTRUCTOR_USERNAME is set, with roles
 //	             `instructor` AND `author`. The second role exists because the
 //	             demo instructor AUTHORS atoms: in chora-tenancy's
-//	             roleSurfaceMap only `author` (and `content_manager`) map to
-//	             the `aplus` surface that gates A+ authoring, so an
-//	             instructor-only account cannot create atoms.
+//	             roleSurfaceMap `instructor` maps to `rplus` only, while
+//	             `author` (like `learner`) maps to `aplus` — the surface that
+//	             gates A+ authoring — so an instructor-only account cannot
+//	             create atoms.
 //	student    — seeded when CHORA_SEED_STUDENT_USERNAME is set. There is no
 //	             `student` value in the stored membership_role vocabulary
 //	             ({learner,instructor,admin,auditor,author,owner} — see
@@ -88,6 +98,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	grpcconn "github.com/apollo-chora/chora-common/grpcconn"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	grpcadapter "github.com/apollo-chora/chora-identity/internal/adapter/grpc"
 	"github.com/apollo-chora/chora-identity/internal/adapter/pg"
@@ -223,9 +235,9 @@ type seedUser struct {
 // account carries role `learner` — the stored membership_role vocabulary has
 // no `student` value (see internal/domain/identity/membership.go). The
 // instructor carries `instructor` AND `author`: the demo instructor authors
-// atoms, and in chora-tenancy's roleSurfaceMap only `author` maps to the
-// `aplus` surface that gates A+ authoring — an instructor-only account cannot
-// create atoms.
+// atoms, and in chora-tenancy's roleSurfaceMap `instructor` maps to `rplus`
+// while `author` (like `learner`) maps to the `aplus` surface that gates A+
+// authoring — an instructor-only account cannot create atoms.
 func seedUsers(cfg config) ([]seedUser, error) {
 	users := []seedUser{{
 		Username: cfg.Username,
@@ -376,8 +388,10 @@ func run(ctx context.Context, pool *pgxpool.Pool, cfg config, tenancyUps tenancy
 	// the identity transaction commits: a seeded user's GCID must already
 	// exist before tenancy can grant them membership. tenancyUps is nil when
 	// SVC_TENANCY_GRPC_URL is unset (dev mode) — main() already logged the
-	// warning; a configured-but-broken tenancy never reaches here because
-	// main() fails on the dial.
+	// warning; a tenancy whose target cannot even be dialled never reaches
+	// here because main() fails on the dial. upsertMembershipWithRetry absorbs
+	// a short startup race on the upserts (transient failures only); anything
+	// else still fails the run here.
 	if tenancyUps != nil {
 		if err := provisionTenancyMemberships(ctx, tenancyUps, cfg.TenantID, users); err != nil {
 			return err
@@ -408,13 +422,88 @@ func provisionTenancyMemberships(ctx context.Context, upserter tenancyMembership
 	for _, u := range users {
 		gcid := seedGcid(authn.NormalizeUsername(u.Username))
 		for _, role := range u.Roles {
-			if _, err := upserter.UpsertMembershipByTenantID(ctx, gcid, tenantID, []string{string(role)}); err != nil {
+			if _, err := upsertMembershipWithRetry(ctx, upserter, gcid, tenantID, string(role)); err != nil {
 				return fmt.Errorf("tenancy membership upsert (gcid=%s tenant=%s role=%s): %w", gcid, tenantID, role, err)
 			}
 			log.Printf("seed: tenancy membership upserted — gcid=%s tenant=%s role=%s", gcid, tenantID, role)
 		}
 	}
 	return nil
+}
+
+// Tenancy upsert retry bound — hardcoded, NOT env-tunable. This is a startup
+// race (Compose may start identity-seed before chora-tenancy's gRPC server
+// accepts connections), not an outage, so the window must stay short: a
+// genuinely down tenancy has to fail the seed promptly, not after a long
+// retry marathon.
+//
+//	tenancyUpsertMaxAttempts = 6, tenancyUpsertBaseBackoff = 100ms doubling:
+//	  ~3.1s of total backoff (100+200+400+800+1600ms) — comfortably covers a
+//	  first-boot gRPC server coming up (container start + migrations), while
+//	  a hard-down tenancy fails the seed within seconds of the first upsert.
+//	tenancyUpsertRetryDeadline = 10s per upsert: cuts off an RPC that hangs
+//	  (half-open mesh connection) instead of failing fast, so it can be
+//	  retried rather than blocking the seed. Derived from the caller's ctx, so
+//	  the seed's overall 30s run context still bounds the whole job — worst
+//	  case (4 upserts × the per-call bound) can never outlive it.
+const (
+	tenancyUpsertMaxAttempts   = 6
+	tenancyUpsertBaseBackoff   = 100 * time.Millisecond
+	tenancyUpsertRetryDeadline = 10 * time.Second
+)
+
+// isTransientTenancyError reports whether err is a startup-race-class failure
+// the seed may retry: gRPC Unavailable/DeadlineExceeded statuses, and
+// connection-refused-style transport errors (a not-yet-listening chora-tenancy
+// surfaces the dialer's raw ECONNREFUSED rather than a gRPC status).
+// Everything else — InvalidArgument, PermissionDenied, FailedPrecondition,
+// AlreadyExists, NotFound, Unauthenticated, and any non-gRPC error — is
+// permanent and must fail the seed immediately.
+func isTransientTenancyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if st, ok := status.FromError(err); ok {
+		return st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "connection refused")
+}
+
+// upsertMembershipWithRetry issues one (gcid, tenant, role) UpsertMembership,
+// retrying TRANSIENT failures only, within the bound above. A permanent error
+// returns on the first attempt; a transient error that outlives the bound
+// returns the last error non-nil — the run still fails non-zero. The per-role
+// upsert shape (one additive call per role) and the caller's ordering are
+// unchanged.
+func upsertMembershipWithRetry(ctx context.Context, upserter tenancyMembershipUpserter, gcid, tenantID, role string) (bool, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, tenancyUpsertRetryDeadline)
+	defer cancel()
+
+	backoff := tenancyUpsertBaseBackoff
+	for attempt := 1; ; attempt++ {
+		ok, err := upserter.UpsertMembershipByTenantID(retryCtx, gcid, tenantID, []string{role})
+		if err == nil {
+			return ok, nil
+		}
+		if !isTransientTenancyError(err) {
+			return false, err
+		}
+		if attempt >= tenancyUpsertMaxAttempts {
+			log.Printf("seed: tenancy upsert giving up after %d attempts (gcid=%s tenant=%s role=%s): %v",
+				attempt, gcid, tenantID, role, err)
+			return false, fmt.Errorf("giving up after %d attempts: %w", attempt, err)
+		}
+		log.Printf("seed: tenancy upsert transient failure (gcid=%s tenant=%s role=%s attempt=%d/%d): %v — retrying",
+			gcid, tenantID, role, attempt, tenancyUpsertMaxAttempts, err)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return false, fmt.Errorf("retry deadline exceeded after %d attempts: %w", attempt, err)
+		case <-timer.C:
+		}
+		backoff *= 2
+	}
 }
 
 // upsertUser writes one seed user (user row, Argon2id credential, active
