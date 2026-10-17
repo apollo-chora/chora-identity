@@ -11,6 +11,18 @@
 //	401:      {"error":{"code":"INVALID_CREDENTIALS","message":"..."}}
 //	403:      {"error":{"code":"ACCOUNT_DISABLED","message":"..."}}
 //
+//	memberships[] entries: {"tenant_id","roles","surfaces"}. surfaces mirrors
+//	the shape the sibling resolve endpoint already emits and is derived by
+//	consulting chora-tenancy (the owner of the role->surface mapping) via
+//	the optional Tenancy port — never re-derived here. roles are sourced from
+//	identity's local tenant_memberships mirror; surfaces from chora-tenancy.
+//	When the port is nil, or the tenancy call fails, surfaces is null in the
+//	JSON and the rest of the body is byte-identical to the pre-surfaces
+//	contract. A tenancy failure or a mirror/tenancy inconsistency (a local
+//	tenant missing from the tenancy response, disagreeing role sets) is
+//	logged, never a new HTTP status, so the status set stays exactly
+//	{200,401,403}.
+//
 // Semantics:
 //   - Username is globally unique (normalised case).
 //   - active_tenant_id / active_tenant_roles are AUTHORITATIVE.
@@ -29,8 +41,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/apollo-chora/chora-identity/internal/domain/authn"
@@ -45,12 +59,18 @@ type VerifyCredentialsConfig struct {
 	Users identity.UserRepository
 	// Memberships loads the GCID's ACTIVE memberships across tenants.
 	Memberships authn.MembershipRepository
+	// Tenancy optionally enriches each membership with surfaces via the
+	// chora-tenancy ListMembershipsByGCID gRPC call. Nil (or a failed call)
+	// leaves surfaces null and the response otherwise unchanged — the login
+	// path must not gain a new failure mode.
+	Tenancy TenancyClient
 }
 
 // VerifyCredentialsMembership is one tenant's role set in the response.
 type VerifyCredentialsMembership struct {
 	TenantID string   `json:"tenant_id"`
 	Roles    []string `json:"roles"`
+	Surfaces []string `json:"surfaces"`
 }
 
 // VerifyCredentialsResponse is the canonical 200-OK body.
@@ -182,6 +202,25 @@ func (h *VerifyCredentialsHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Surfaces are owned by chora-tenancy's role->surface derivation — never
+	// re-derived here. Best-effort: a nil port or a failed call leaves
+	// surfaces null (logged) so login never gains a new failure mode.
+	var tenancyByTenant map[string]TenantMembership
+	if h.cfg.Tenancy != nil {
+		resolution, terr := h.cfg.Tenancy.ListMembershipsByGCID(ctx, user.Gcid)
+		if terr != nil {
+			log.Printf("identity: verify-credentials tenancy surfaces lookup failed (non-fatal) for gcid=%s: %v", user.Gcid, terr)
+		} else {
+			tenancyByTenant = make(map[string]TenantMembership, len(resolution.Memberships))
+			for _, m := range resolution.Memberships {
+				if _, dup := tenancyByTenant[m.TenantID]; dup {
+					log.Printf("identity: verify-credentials tenancy response has duplicate entry for tenant %s (last wins)", m.TenantID)
+				}
+				tenancyByTenant[m.TenantID] = m
+			}
+		}
+	}
+
 	resp := VerifyCredentialsResponse{
 		GCID:              user.Gcid,
 		Email:             user.Email,
@@ -190,10 +229,20 @@ func (h *VerifyCredentialsHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		Memberships:       make([]VerifyCredentialsMembership, 0, len(groups)),
 	}
 	for _, g := range groups {
-		resp.Memberships = append(resp.Memberships, VerifyCredentialsMembership{
+		m := VerifyCredentialsMembership{
 			TenantID: g.TenantID,
 			Roles:    g.Roles,
-		})
+		}
+		if tenancyByTenant != nil {
+			m.Surfaces = tenancyByTenant[g.TenantID].Surfaces
+		}
+		resp.Memberships = append(resp.Memberships, m)
+	}
+
+	// Detection only: log mirror/tenancy divergence, never change the status
+	// set or the body. Roles stay mirror-sourced; surfaces stay tenancy-sourced.
+	for _, w := range surfaceConsistency(resp.Memberships, tenancyByTenant) {
+		log.Printf("identity: verify-credentials membership consistency: %s", w)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -206,6 +255,47 @@ func (h *VerifyCredentialsHandler) writeError(w http.ResponseWriter, status int,
 	writeJSON(w, status, VerifyCredentialsError{
 		Error: VerifyCredentialsErrorBody{Code: code, Message: msg},
 	})
+}
+
+// surfaceConsistency compares the locally mirrored memberships (the roles
+// source) against the tenancy resolution (the surfaces source) and returns
+// one human-readable warning per detected inconsistency. Nil when the tenancy
+// port is not wired (nothing to compare against); empty when the two agree.
+// Pure detection — the caller logs; nothing here changes the response.
+func surfaceConsistency(local []VerifyCredentialsMembership, tenancy map[string]TenantMembership) []string {
+	if tenancy == nil {
+		return nil
+	}
+	var warnings []string
+	for _, lm := range local {
+		tm, ok := tenancy[lm.TenantID]
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf(
+				"tenant %s present in identity mirror but absent from tenancy response (surfaces will be null)", lm.TenantID))
+			continue
+		}
+		if roleSetKey(lm.Roles) != roleSetKey(tm.Roles) {
+			warnings = append(warnings, fmt.Sprintf(
+				"tenant %s role sets disagree: identity mirror=%v tenancy=%v (roles stay mirror-sourced, surfaces stay tenancy-sourced)",
+				lm.TenantID, lm.Roles, tm.Roles))
+		}
+	}
+	return warnings
+}
+
+// roleSetKey normalises a role set for comparison: trims, lowercases (the
+// platform treats role tokens case-insensitively), drops empties, sorts.
+func roleSetKey(roles []string) string {
+	seen := make([]string, 0, len(roles))
+	for _, r := range roles {
+		t := strings.ToLower(strings.TrimSpace(r))
+		if t == "" {
+			continue
+		}
+		seen = append(seen, t)
+	}
+	sort.Strings(seen)
+	return strings.Join(seen, ",")
 }
 
 // dummyVerify runs an Argon2 verification against a throwaway hash so a lookup
