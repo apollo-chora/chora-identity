@@ -11,6 +11,9 @@ import (
 
 	"github.com/apollo-chora/chora-identity/internal/domain/authn"
 	mana "github.com/apollo-chora/chora-identity/internal/domain/user_mana"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // setAdminEnv sets the required admin seed env to valid values. Optional
@@ -202,8 +205,9 @@ func TestSeedUsers_InstructorAndStudent(t *testing.T) {
 		t.Errorf("users[0] = %q roles %v, want Admin/[admin]", users[0].Username, users[0].Roles)
 	}
 	// The instructor carries instructor AND author: the demo instructor authors
-	// atoms, and only `author` maps to the `aplus` surface that gates A+
-	// authoring (see seedUsers).
+	// atoms, and in chora-tenancy's roleSurfaceMap `instructor` maps to `rplus`
+	// while `author` (like `learner`) maps to `aplus`, the surface that gates
+	// A+ authoring (see seedUsers).
 	if users[1].Username != "instructor" || len(users[1].Roles) != 2 ||
 		users[1].Roles[0] != "instructor" || users[1].Roles[1] != "author" {
 		t.Errorf("users[1] = %q roles %v, want instructor/[instructor author]", users[1].Username, users[1].Roles)
@@ -233,9 +237,14 @@ func TestSeedUsers_RejectsDuplicateUsername(t *testing.T) {
 // fakeTenancyUpserter records UpsertMembershipByTenantID calls and fails them
 // when failErr is set. It implements the seed's tenancyMembershipUpserter port
 // without dialing a real chora-tenancy server.
+//
+// failErr applies to every call unless failFirst is set: failFirst = N fails
+// only the first N calls with failErr and lets later calls succeed — the
+// startup-race shape (transient error, then a server that is up).
 type fakeTenancyUpserter struct {
-	calls   []fakeUpsertCall
-	failErr error
+	calls     []fakeUpsertCall
+	failErr   error
+	failFirst int
 }
 
 type fakeUpsertCall struct {
@@ -248,7 +257,7 @@ func (f *fakeTenancyUpserter) UpsertMembershipByTenantID(_ context.Context, gcid
 	f.calls = append(f.calls, fakeUpsertCall{
 		gcid: gcid, tenantID: tenantID, roles: append([]string(nil), roles...),
 	})
-	if f.failErr != nil {
+	if f.failErr != nil && (f.failFirst == 0 || len(f.calls) <= f.failFirst) {
 		return false, f.failErr
 	}
 	return true, nil
@@ -327,6 +336,156 @@ func TestProvisionTenancyMemberships_UpsertErrorFails(t *testing.T) {
 	}
 	if len(fake.calls) != 1 {
 		t.Errorf("calls after failure = %d, want 1 (fail fast on the first error)", len(fake.calls))
+	}
+}
+
+func TestProvisionTenancyMemberships_TransientFailureRetried(t *testing.T) {
+	setAdminEnv(t)
+	t.Setenv("CHORA_SEED_INSTRUCTOR_USERNAME", "instructor")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_EMAIL", "instructor@example.com")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_PASSWORD", "hunter2")
+	t.Setenv("CHORA_SEED_STUDENT_USERNAME", "student")
+	t.Setenv("CHORA_SEED_STUDENT_EMAIL", "student@example.com")
+	t.Setenv("CHORA_SEED_STUDENT_PASSWORD", "hunter2")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	// gRPC Unavailable on the first attempt, then success: the signature of
+	// identity-seed starting before chora-tenancy accepts connections.
+	fake := &fakeTenancyUpserter{
+		failErr:   status.Error(codes.Unavailable, "connection refused"),
+		failFirst: 1,
+	}
+	if err := provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users); err != nil {
+		t.Fatalf("provisionTenancyMemberships: %v", err)
+	}
+
+	// 4 upserts (admin only) + 1 retried attempt = 5 calls.
+	if len(fake.calls) != 5 {
+		t.Fatalf("calls = %d, want 5 (one retried transient failure): %+v", len(fake.calls), fake.calls)
+	}
+	// The retried call re-issues the admin upsert with the identical shape.
+	if fake.calls[0].gcid != fake.calls[1].gcid || fake.calls[0].tenantID != fake.calls[1].tenantID ||
+		fake.calls[0].roles[0] != fake.calls[1].roles[0] || fake.calls[1].roles[0] != "admin" {
+		t.Errorf("calls[0]=%+v calls[1]=%+v, want the first admin upsert retried identically",
+			fake.calls[0], fake.calls[1])
+	}
+}
+
+func TestProvisionTenancyMemberships_TransientFailureMidSequenceRetried(t *testing.T) {
+	setAdminEnv(t)
+	t.Setenv("CHORA_SEED_INSTRUCTOR_USERNAME", "instructor")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_EMAIL", "instructor@example.com")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_PASSWORD", "hunter2")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	// Two transient failures (admin, then the instructor's first role), then
+	// everything succeeds: the retry is per-upsert, not just for the first.
+	fake := &fakeTenancyUpserter{
+		failErr:   status.Error(codes.DeadlineExceeded, "startup race"),
+		failFirst: 2,
+	}
+	if err := provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users); err != nil {
+		t.Fatalf("provisionTenancyMemberships: %v", err)
+	}
+
+	// 3 upserts for this roster (admin, instructor's two roles) + 2 retries.
+	wantCalls := 3 + 2
+	if len(fake.calls) != wantCalls {
+		t.Fatalf("calls = %d, want %d (two retried transient failures): %+v", len(fake.calls), wantCalls, fake.calls)
+	}
+}
+
+func TestProvisionTenancyMemberships_ConnectionRefusedRetried(t *testing.T) {
+	setAdminEnv(t)
+	t.Setenv("CHORA_SEED_INSTRUCTOR_USERNAME", "instructor")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_EMAIL", "instructor@example.com")
+	t.Setenv("CHORA_SEED_INSTRUCTOR_PASSWORD", "hunter2")
+	t.Setenv("CHORA_SEED_STUDENT_USERNAME", "student")
+	t.Setenv("CHORA_SEED_STUDENT_EMAIL", "student@example.com")
+	t.Setenv("CHORA_SEED_STUDENT_PASSWORD", "hunter2")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	// A connection-refused transport error (raw ECONNREFUSED, no gRPC status)
+	// is startup-race-class too and must be retried.
+	fake := &fakeTenancyUpserter{
+		failErr:   errors.New(`dial tcp 10.244.0.5:9090: connect: connection refused`),
+		failFirst: 1,
+	}
+	if err := provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users); err != nil {
+		t.Fatalf("provisionTenancyMemberships: %v", err)
+	}
+	if len(fake.calls) != 5 {
+		t.Fatalf("calls = %d, want 5 (connection-refused retried): %+v", len(fake.calls), fake.calls)
+	}
+}
+
+func TestProvisionTenancyMemberships_PermanentErrorNotRetried(t *testing.T) {
+	setAdminEnv(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	// InvalidArgument is a permanent error: no retry, the run fails at once.
+	fake := &fakeTenancyUpserter{failErr: status.Error(codes.InvalidArgument, "bad gcid")}
+	err = provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users)
+	if err == nil {
+		t.Fatal("provisionTenancyMemberships err = nil, want InvalidArgument to fail the run")
+	}
+	if len(fake.calls) != 1 {
+		t.Errorf("calls after permanent failure = %d, want 1 (permanent errors are never retried)", len(fake.calls))
+	}
+}
+
+func TestProvisionTenancyMemberships_RetryBudgetExhausted(t *testing.T) {
+	setAdminEnv(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	users, err := seedUsers(cfg)
+	if err != nil {
+		t.Fatalf("seedUsers: %v", err)
+	}
+
+	// Every attempt transiently unavailable: the run must still fail
+	// non-zero, after exactly the bounded number of attempts — retries are
+	// for the startup race, not an outage.
+	fake := &fakeTenancyUpserter{failErr: status.Error(codes.Unavailable, "still starting")}
+	err = provisionTenancyMemberships(context.Background(), fake, cfg.TenantID, users)
+	if err == nil {
+		t.Fatal("provisionTenancyMemberships err = nil, want the exhausted retry budget to fail the run")
+	}
+	if !strings.Contains(err.Error(), "giving up after") || !strings.Contains(err.Error(), "attempts") {
+		t.Errorf("error = %v, want it to report the exhausted retry budget", err)
+	}
+	if len(fake.calls) != tenancyUpsertMaxAttempts {
+		t.Errorf("calls = %d, want %d (the retry bound; no more, ever)", len(fake.calls), tenancyUpsertMaxAttempts)
 	}
 }
 
