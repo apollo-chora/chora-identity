@@ -61,6 +61,18 @@ func (f *fakeMemberRepo) ListActiveByGCID(_ context.Context, gcid string) ([]aut
 	return f.memberships[gcid], nil
 }
 
+type fakeTenancyClient struct {
+	memberships []TenantMembership
+	err         error
+}
+
+func (f *fakeTenancyClient) ListMembershipsByGCID(_ context.Context, _ string) (*MembershipsResolution, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &MembershipsResolution{Memberships: f.memberships}, nil
+}
+
 // -----------------------------------------------------------------------------
 // helpers
 // -----------------------------------------------------------------------------
@@ -75,6 +87,11 @@ func mustHash(t *testing.T, pw string) string {
 }
 
 func newVerifyFixture(t *testing.T) (*VerifyCredentialsHandler, *fakeCredRepo, *fakeUserRepo, *fakeMemberRepo) {
+	t.Helper()
+	return newVerifyFixtureWithTenancy(t, nil)
+}
+
+func newVerifyFixtureWithTenancy(t *testing.T, tenancy TenancyClient) (*VerifyCredentialsHandler, *fakeCredRepo, *fakeUserRepo, *fakeMemberRepo) {
 	t.Helper()
 	now := time.Now()
 	cred := &fakeCredRepo{byNorm: map[string]*authn.Credentials{
@@ -104,6 +121,7 @@ func newVerifyFixture(t *testing.T) (*VerifyCredentialsHandler, *fakeCredRepo, *
 		Credentials: cred,
 		Users:       users,
 		Memberships: members,
+		Tenancy:     tenancy,
 	})
 	return h, cred, users, members
 }
@@ -149,6 +167,12 @@ func TestVerifyCredentials_HappyPath(t *testing.T) {
 	}
 	if len(resp.Memberships) != 1 || resp.Memberships[0].TenantID != resp.ActiveTenantID {
 		t.Errorf("memberships = %+v", resp.Memberships)
+	}
+	// Nil Tenancy port: surfaces must be absent, everything else unchanged.
+	for _, m := range resp.Memberships {
+		if len(m.Surfaces) != 0 {
+			t.Errorf("member %q surfaces = %v, want absent with nil Tenancy", m.TenantID, m.Surfaces)
+		}
 	}
 	// Field-for-field contract: exactly these keys.
 	var raw map[string]json.RawMessage
@@ -283,5 +307,51 @@ func TestVerifyCredentials_MembershipLookupErrorIs500(t *testing.T) {
 	rec := postVerify(t, h, `{"username":"admin","password":"hunter2"}`)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestVerifyCredentials_TenancySurfacesIncluded(t *testing.T) {
+	h, _, _, _ := newVerifyFixtureWithTenancy(t, &fakeTenancyClient{
+		memberships: []TenantMembership{
+			{
+				TenantID: "22222222-2222-7222-8222-222222222222",
+				Roles:    []string{"admin", "learner"},
+				Surfaces: []string{"aplus"},
+			},
+		},
+	})
+	rec := postVerify(t, h, `{"username":"Admin","password":"hunter2"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp VerifyCredentialsResponse
+	decodeVerifyBody(t, rec, &resp)
+	if len(resp.Memberships) != 1 {
+		t.Fatalf("memberships = %d, want 1", len(resp.Memberships))
+	}
+	if len(resp.Memberships[0].Surfaces) != 1 || resp.Memberships[0].Surfaces[0] != "aplus" {
+		t.Errorf("surfaces = %v, want [aplus]", resp.Memberships[0].Surfaces)
+	}
+	// The rest of the body is unchanged by the surfaces enrichment.
+	if resp.ActiveTenantID != "22222222-2222-7222-8222-222222222222" {
+		t.Errorf("active_tenant_id = %q", resp.ActiveTenantID)
+	}
+}
+
+func TestVerifyCredentials_TenancyErrorIsNonFatal(t *testing.T) {
+	h, _, _, _ := newVerifyFixtureWithTenancy(t, &fakeTenancyClient{err: errors.New("tenancy down")})
+	rec := postVerify(t, h, `{"username":"Admin","password":"hunter2"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (tenancy failure is non-fatal), body = %s", rec.Code, rec.Body.String())
+	}
+	var resp VerifyCredentialsResponse
+	decodeVerifyBody(t, rec, &resp)
+	if resp.ActiveTenantID != "22222222-2222-7222-8222-222222222222" {
+		t.Errorf("active_tenant_id = %q — rest of the body must be unchanged", resp.ActiveTenantID)
+	}
+	for _, m := range resp.Memberships {
+		if len(m.Surfaces) != 0 {
+			t.Errorf("member %q surfaces = %v, want absent on tenancy error", m.TenantID, m.Surfaces)
+		}
 	}
 }

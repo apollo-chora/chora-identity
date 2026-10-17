@@ -11,6 +11,15 @@
 //	401:      {"error":{"code":"INVALID_CREDENTIALS","message":"..."}}
 //	403:      {"error":{"code":"ACCOUNT_DISABLED","message":"..."}}
 //
+//	memberships[] entries: {"tenant_id","roles","surfaces"}. surfaces mirrors
+//	the shape the sibling resolve endpoint already emits and is derived by
+//	consulting chora-tenancy (the owner of the role->surface mapping) via
+//	the optional Tenancy port — never re-derived here. When the port is nil,
+//	or the tenancy call fails, surfaces is null in the JSON and the rest of
+//	the body is byte-identical to the pre-surfaces contract: a tenancy
+//	failure is logged, never a new HTTP status, so the status set stays
+//	exactly {200,401,403}.
+//
 // Semantics:
 //   - Username is globally unique (normalised case).
 //   - active_tenant_id / active_tenant_roles are AUTHORITATIVE.
@@ -45,12 +54,18 @@ type VerifyCredentialsConfig struct {
 	Users identity.UserRepository
 	// Memberships loads the GCID's ACTIVE memberships across tenants.
 	Memberships authn.MembershipRepository
+	// Tenancy optionally enriches each membership with surfaces via the
+	// chora-tenancy ListMembershipsByGCID gRPC call. Nil (or a failed call)
+	// leaves surfaces null and the response otherwise unchanged — the login
+	// path must not gain a new failure mode.
+	Tenancy TenancyClient
 }
 
 // VerifyCredentialsMembership is one tenant's role set in the response.
 type VerifyCredentialsMembership struct {
 	TenantID string   `json:"tenant_id"`
 	Roles    []string `json:"roles"`
+	Surfaces []string `json:"surfaces"`
 }
 
 // VerifyCredentialsResponse is the canonical 200-OK body.
@@ -182,6 +197,22 @@ func (h *VerifyCredentialsHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Surfaces are owned by chora-tenancy's role->surface derivation — never
+	// re-derived here. Best-effort: a nil port or a failed call leaves
+	// surfaces null (logged) so login never gains a new failure mode.
+	var surfacesByTenant map[string][]string
+	if h.cfg.Tenancy != nil {
+		resolution, terr := h.cfg.Tenancy.ListMembershipsByGCID(ctx, user.Gcid)
+		if terr != nil {
+			log.Printf("identity: verify-credentials tenancy surfaces lookup failed (non-fatal) for gcid=%s: %v", user.Gcid, terr)
+		} else {
+			surfacesByTenant = make(map[string][]string, len(resolution.Memberships))
+			for _, m := range resolution.Memberships {
+				surfacesByTenant[m.TenantID] = m.Surfaces
+			}
+		}
+	}
+
 	resp := VerifyCredentialsResponse{
 		GCID:              user.Gcid,
 		Email:             user.Email,
@@ -190,10 +221,14 @@ func (h *VerifyCredentialsHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		Memberships:       make([]VerifyCredentialsMembership, 0, len(groups)),
 	}
 	for _, g := range groups {
-		resp.Memberships = append(resp.Memberships, VerifyCredentialsMembership{
+		m := VerifyCredentialsMembership{
 			TenantID: g.TenantID,
 			Roles:    g.Roles,
-		})
+		}
+		if surfacesByTenant != nil {
+			m.Surfaces = surfacesByTenant[g.TenantID]
+		}
+		resp.Memberships = append(resp.Memberships, m)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

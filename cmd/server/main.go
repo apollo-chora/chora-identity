@@ -808,6 +808,12 @@ func main() {
 	// Boot fails LOUD on missing env when CHORA_ENV=prod; in dev the resolve
 	// route is intentionally NOT mounted (falls through to legacy handlers).
 	var resolveHandler *httpadapter.ResolveHandler
+	// tenancyClient is shared by /v1/identity/resolve AND
+	// /v1/auth/verify-credentials (surfaces enrichment). Declared in this
+	// outer scope because the verify-credentials wiring below sits outside
+	// the tenancy-dial else-block; it stays nil when SVC_TENANCY_GRPC_URL is
+	// unset (dev), in which case verify-credentials emits surfaces: null.
+	var tenancyClient *grpcadapter.TenancyClient
 	// adminMembershipUpserter is the ADR-182 authoritative add-member
 	// write path (tenancy UpsertMembership) consumed by the
 	// tenant-members admin handler below. Stays nil without a tenancy
@@ -835,7 +841,7 @@ func main() {
 				log.Printf("identity: tenancy gRPC conn.Close: %v", cerr)
 			}
 		}()
-		tenancyClient, err := grpcadapter.NewTenancyClient(conn)
+		tenancyClient, err = grpcadapter.NewTenancyClient(conn)
 		if err != nil {
 			log.Fatalf("identity: tenancy client: %v", err)
 		}
@@ -924,12 +930,17 @@ func main() {
 	// pg pool (local_credentials + the membership helper, migration 0042);
 	// without it the route is intentionally NOT mounted so a misconfigured pod
 	// surfaces a clean 404 rather than a wrong-shape stub.
+	//
+	// Tenancy is best-effort: when the tenancy gRPC conn above was wired,
+	// memberships carry surfaces derived by chora-tenancy; without it (or on
+	// a failed call) surfaces is null and login still succeeds.
 	if pool != nil {
 		authnRepo := pg.NewAuthnRepository(pg.NewPgxPoolQuerier(pool))
 		verifyCredsHandler := httpadapter.NewVerifyCredentialsHandler(httpadapter.VerifyCredentialsConfig{
 			Credentials: authnRepo,
 			Users:       resolveUsers,
 			Memberships: authnRepo,
+			Tenancy:     tenancyClient,
 		})
 		verifyCredsHandler.RegisterRoutes(composed)
 		log.Printf("identity: /v1/auth/verify-credentials wired (local username/password, migration 0042)")
